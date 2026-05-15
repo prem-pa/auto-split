@@ -51,10 +51,11 @@ class Settings(BaseSettings):
     # AI providers
     groq_api_key: SecretStr = SecretStr("")
     gemini_api_key: SecretStr = SecretStr("")
-    # Gemini model id. Override via .env if the default isn't in the free tier
-    # on your Cloud project (Google rotates models in/out of free tier over time).
-    # Example values: "gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-lite".
-    gemini_model: str = "gemini-2.0-flash"
+    # Gemini model id. Default chosen for the most generous free-tier quota
+    # (500 RPD on the autosplit project as of 2026-05). Override via .env if
+    # Google moves models in/out of free tier or you want stronger reasoning.
+    # See https://aistudio.google.com/rate-limit for current per-project caps.
+    gemini_model: str = "gemini-3.1-flash-lite"
 
     # Supabase
     supabase_url: str = ""
