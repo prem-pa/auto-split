@@ -31,6 +31,8 @@ class _DBModel(BaseModel):
 class User(_DBModel):
     telegram_user_id: int
     telegram_username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     splitwise_user_id: int | None = None
     splitwise_access_token: str | None = None
     default_currency: str = "USD"

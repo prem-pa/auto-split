@@ -134,8 +134,13 @@ def test_idempotent_when_already_applied(
     _set_db_url: None,
 ) -> None:
     mod = _load_migrate_module()
-    # Pretend the init migration is already applied.
-    cursor = _FakeCursor(fetchall_results=[[("0001_init.sql",)]])
+    # Pretend EVERY discovered migration is already applied.
+    project_root = Path(__file__).resolve().parents[2]
+    all_names = [
+        p.name
+        for p in sorted((project_root / "app" / "db" / "migrations").glob("*.sql"))
+    ]
+    cursor = _FakeCursor(fetchall_results=[[(name,) for name in all_names]])
     conn = _FakeConn(cursor)
     monkeypatch.setattr(mod.psycopg, "connect", MagicMock(return_value=conn))
 
@@ -143,7 +148,7 @@ def test_idempotent_when_already_applied(
     assert rc == 0
 
     sqls = [s for s, _ in cursor.executed]
-    # The CREATE TABLE for ``users`` should NOT have been re-applied.
+    # No domain CREATE TABLE should have been re-applied.
     assert not any("CREATE TABLE IF NOT EXISTS users" in s for s in sqls)
     # And no INSERT into schema_migrations should have happened.
     assert not any("INSERT INTO schema_migrations" in s for s in sqls)

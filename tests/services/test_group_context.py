@@ -150,3 +150,88 @@ def test_module_exports_helpers() -> None:
     # Quick sanity that ``__all__`` matches what we import in callers.
     for sym in ("build_group_context", "resolve_split_names", "UNRESOLVED"):
         assert hasattr(group_context, sym)
+
+
+# --- first_name / last_name matching --------------------------------------
+
+
+def test_resolve_matches_by_first_name_when_username_is_none() -> None:
+    """The motivating bug: 'Shreya' must match a user whose
+    telegram_username is null but first_name='Shreya'.
+    """
+    members = [
+        User(
+            telegram_user_id=8,
+            telegram_username=None,
+            first_name="Shreya",
+            splitwise_user_id=2,
+        )
+    ]
+    out = resolve_split_names(
+        [Split(name="Shreya", share=0.5), Split(name="self", share=0.5)],
+        members,
+        payer_telegram_user_id=7,
+        payer_splitwise_user_id=1,
+    )
+    assert out[0].telegram_user_id == 8
+    assert out[0].splitwise_user_id == 2
+    assert not out[0].ambiguous
+
+
+def test_resolve_matches_by_first_name_even_when_username_is_unrelated() -> None:
+    """'Shreya' should still resolve when username is e.g. 'racecar99'."""
+    members = [
+        User(
+            telegram_user_id=8,
+            telegram_username="racecar99",
+            first_name="Shreya",
+            splitwise_user_id=2,
+        )
+    ]
+    out = resolve_split_names(
+        [Split(name="Shreya", share=1.0)],
+        members,
+        payer_telegram_user_id=7,
+        payer_splitwise_user_id=1,
+    )
+    assert out[0].telegram_user_id == 8
+
+
+def test_resolve_dedupes_when_single_user_matches_multiple_candidates() -> None:
+    """A user with first_name='Shreya' AND username='shreya' should
+    still count as ONE match (not flagged as ambiguous)."""
+    members = [
+        User(
+            telegram_user_id=8,
+            telegram_username="shreya",
+            first_name="Shreya",
+            splitwise_user_id=2,
+        )
+    ]
+    out = resolve_split_names(
+        [Split(name="shreya", share=1.0)],
+        members,
+        payer_telegram_user_id=7,
+        payer_splitwise_user_id=1,
+    )
+    assert not out[0].ambiguous
+    assert out[0].telegram_user_id == 8
+
+
+def test_resolve_username_still_works_as_fallback() -> None:
+    """If only telegram_username is set (no first_name), match still works."""
+    members = [
+        User(
+            telegram_user_id=8,
+            telegram_username="priya_p",
+            first_name=None,
+            splitwise_user_id=2,
+        )
+    ]
+    out = resolve_split_names(
+        [Split(name="priya", share=1.0)],
+        members,
+        payer_telegram_user_id=7,
+        payer_splitwise_user_id=1,
+    )
+    assert out[0].telegram_user_id == 8  # prefix-matched "priya_p"

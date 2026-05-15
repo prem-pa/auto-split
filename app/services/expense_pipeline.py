@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any
 from uuid import UUID
 
 from telegram import CallbackQuery, Update
@@ -39,6 +40,7 @@ from app.db.expenses import (
     mark_completed,
 )
 from app.db.groups import list_group_members, record_membership
+from app.db.users import upsert_user
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -65,6 +67,27 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+async def _capture_user_identity(user: Any) -> None:
+    """Upsert the sender's identity columns from a Telegram ``User``.
+
+    Best-effort: failures are logged and swallowed so a flaky DB write
+    never blocks dispatch. We feed first_name + last_name + username
+    here so the orchestrator's name resolver can match natural-language
+    references in voice notes ("split with Shreya") to the right row.
+    """
+    if user is None:
+        return
+    try:
+        await upsert_user(
+            telegram_user_id=user.id,
+            telegram_username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never crash dispatch
+        log.exception("upsert_user (identity capture) failed user_id=%s", user.id)
+
+
 async def handle_incoming_message(update: Update) -> None:
     """Top-level message router (DMs and groups, not callbacks).
 
@@ -88,6 +111,10 @@ async def handle_incoming_message(update: Update) -> None:
     is_private = chat.type == "private"
     telegram_user_id = user.id
     chat_id = chat.id
+
+    # Capture identity (first_name / last_name / username) on every message
+    # so the name resolver can match natural-language references later.
+    await _capture_user_identity(user)
 
     # Always remember the sender exists in this group, regardless of
     # whether the message itself triggers a capture flow.
@@ -138,6 +165,9 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
         log.warning("callback without from_user: data=%r", data)
         return
     telegram_user_id = user.id
+
+    # Refresh identity columns on every interaction.
+    await _capture_user_identity(user)
 
     # Best-effort spinner clear; never let this kill the handler.
     try:

@@ -64,12 +64,30 @@ class ResolvedSplit:
 def _display_name(user: User) -> str:
     """Best-effort human-readable name for ``user``.
 
-    Order of preference: Telegram username, telegram_user_id as a string
-    fallback. We do not have first/last name in our schema (Telegram doesn't
-    push them through the privacy-mode filter reliably for groups), so this
-    is deliberately spartan.
+    Order of preference: first_name, telegram_username, telegram_user_id
+    as a string fallback. We prefer ``first_name`` because that's what
+    the parser is most likely to hear in a voice note ("split with
+    Shreya") — the @username is for matching only.
     """
+    if user.first_name:
+        return user.first_name
     return user.telegram_username or f"user_{user.telegram_user_id}"
+
+
+def _name_candidates(user: User) -> list[str]:
+    """Every string we'll accept as referring to ``user`` in a split.
+
+    Order doesn't matter for matching, but we keep first_name first for
+    clarity. Empty / falsy values are skipped.
+    """
+    candidates: list[str] = []
+    if user.first_name:
+        candidates.append(user.first_name)
+    if user.last_name:
+        candidates.append(user.last_name)
+    if user.telegram_username:
+        candidates.append(user.telegram_username)
+    return candidates
 
 
 async def build_group_context(
@@ -124,6 +142,23 @@ def _normalise(name: str) -> str:
     return _NORMALISE_RE.sub("", name.lower())
 
 
+def _dedupe_by_user(users: list[User]) -> list[User]:
+    """Dedupe a list of User by ``telegram_user_id`` preserving first-seen order.
+
+    Needed because a single user has multiple name candidates (first_name,
+    last_name, username) — if a query matches more than one of them, naive
+    flattening would double-count them.
+    """
+    seen: set[int] = set()
+    out: list[User] = []
+    for u in users:
+        if u.telegram_user_id in seen:
+            continue
+        seen.add(u.telegram_user_id)
+        out.append(u)
+    return out
+
+
 def resolve_split_names(
     splits: list[ParsedSplit],
     group_members: list[User],
@@ -135,24 +170,32 @@ def resolve_split_names(
 
     Matching rules (case- and punctuation-insensitive):
         1. ``"self"`` → the payer.
-        2. Exact match against ``telegram_username``.
-        3. Prefix match (``"priya"`` matches ``"priya_p"``) IF unique.
+        2. Exact match against any of a member's name candidates
+           (first_name, last_name, telegram_username) — preferred.
+        3. Prefix match across the same candidates — fallback.
         4. Anything else → :data:`UNRESOLVED`, ``ambiguous=False``.
 
-    Multiple matches at step 2 or 3 produce ``ambiguous=True``.
+    Multiple distinct members matching at step 2 or 3 produce
+    ``ambiguous=True``. A single member matching via multiple of their
+    own candidates is still one match (not ambiguous).
 
-    The payer is always resolvable; everyone else must already be a member
-    and connected (have a ``splitwise_user_id``) for the orchestrator to
-    actually post the expense to Splitwise. ``splitwise_user_id`` may still
-    be ``None`` here — the orchestrator decides what to do about that.
+    ``splitwise_user_id`` may be ``None`` on a resolved member if they
+    haven't OAuth'd yet — the orchestrator decides whether to surface
+    that to the user.
     """
-    # Pre-index members by their normalised display name.
+    # Pre-index every (candidate -> [users]) so a single user with both a
+    # first_name and a username appears under multiple keys.
     by_norm_name: dict[str, list[User]] = {}
     for m in group_members:
         if m.telegram_user_id == payer_telegram_user_id:
             continue
-        key = _normalise(_display_name(m))
-        by_norm_name.setdefault(key, []).append(m)
+        for cand in _name_candidates(m):
+            key = _normalise(cand)
+            if not key:
+                continue
+            bucket = by_norm_name.setdefault(key, [])
+            if not any(u.telegram_user_id == m.telegram_user_id for u in bucket):
+                bucket.append(m)
 
     resolved: list[ResolvedSplit] = []
     for split in splits:
@@ -168,7 +211,10 @@ def resolve_split_names(
             )
             continue
 
-        exact = by_norm_name.get(norm, [])
+        # 1. Exact match — preferred. Dedupe by user in case a user
+        #    appears under multiple keys that all happen to equal ``norm``
+        #    (rare but possible if first_name == username).
+        exact = _dedupe_by_user(by_norm_name.get(norm, []))
         if len(exact) == 1:
             user = exact[0]
             resolved.append(
@@ -182,7 +228,7 @@ def resolve_split_names(
             continue
         if len(exact) > 1:
             log.info(
-                "resolve_split_names: ambiguous name=%r matches=%d",
+                "resolve_split_names: ambiguous exact name=%r matches=%d",
                 split.name,
                 len(exact),
             )
@@ -197,16 +243,14 @@ def resolve_split_names(
             )
             continue
 
-        # Prefix search across all members.
-        prefix_hits = [
-            users
-            for key, users in by_norm_name.items()
-            if norm and key.startswith(norm)
-        ]
-        # Flatten — multiple keys may each have multiple users.
-        flat = [u for group in prefix_hits for u in group]
-        if len(flat) == 1:
-            user = flat[0]
+        # 2. Prefix match across all candidates, deduped by user.
+        prefix_users: list[User] = []
+        for key, users in by_norm_name.items():
+            if norm and key.startswith(norm):
+                prefix_users.extend(users)
+        prefix_users = _dedupe_by_user(prefix_users)
+        if len(prefix_users) == 1:
+            user = prefix_users[0]
             resolved.append(
                 ResolvedSplit(
                     name=split.name,
@@ -216,11 +260,11 @@ def resolve_split_names(
                 )
             )
             continue
-        if len(flat) > 1:
+        if len(prefix_users) > 1:
             log.info(
                 "resolve_split_names: ambiguous prefix name=%r matches=%d",
                 split.name,
-                len(flat),
+                len(prefix_users),
             )
             resolved.append(
                 ResolvedSplit(
@@ -233,7 +277,7 @@ def resolve_split_names(
             )
             continue
 
-        # No match found at all.
+        # 3. No match found at all.
         log.info("resolve_split_names: no match name=%r", split.name)
         resolved.append(
             ResolvedSplit(

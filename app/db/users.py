@@ -40,22 +40,33 @@ async def get_user(telegram_user_id: int) -> User | None:
 
 async def upsert_user(
     telegram_user_id: int,
-    telegram_username: str | None,
+    telegram_username: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
 ) -> User:
     """Insert or update a user row by ``telegram_user_id``.
 
-    Only ``telegram_user_id`` and ``telegram_username`` are touched here.
-    Splitwise fields are set separately via :func:`set_user_token` so we
-    never accidentally clobber a stored token on a routine username
-    refresh.
+    Only identity columns are touched here — Splitwise token fields are
+    set separately via :func:`set_user_token` so we never accidentally
+    clobber a stored token on a routine identity refresh.
+
+    Fields passed as ``None`` are *omitted* from the payload (and thus
+    not overwritten in an existing row). This means calling
+    ``upsert_user(123, first_name="Prem")`` will set first_name without
+    nuking any previously-stored telegram_username — important because
+    Telegram updates may carry first_name without username, or vice
+    versa.
     """
 
     def _q() -> User:
         client = get_supabase()
-        payload = {
-            "telegram_user_id": telegram_user_id,
-            "telegram_username": telegram_username,
-        }
+        payload: dict[str, object] = {"telegram_user_id": telegram_user_id}
+        if telegram_username is not None:
+            payload["telegram_username"] = telegram_username
+        if first_name is not None:
+            payload["first_name"] = first_name
+        if last_name is not None:
+            payload["last_name"] = last_name
         resp = (
             client.table(_TABLE)
             .upsert(payload, on_conflict="telegram_user_id")
