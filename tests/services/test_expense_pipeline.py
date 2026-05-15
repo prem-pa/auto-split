@@ -1,0 +1,443 @@
+"""Tests for :mod:`app.services.expense_pipeline`.
+
+Every external boundary is mocked; we exercise the orchestrator's
+own decisions (routing, error paths, payload shape, idempotency).
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from telegram import Bot, Update
+
+from app.ai.schema import ParsedExpense, Split
+from app.db.models import User
+from app.services import expense_pipeline
+from app.telegram import keyboards
+from tests.services.conftest import PipelineMocks
+
+
+# ---------------------------------------------------------------------------
+# Helpers for building fake Update payloads.
+# ---------------------------------------------------------------------------
+
+
+def _fake_bot() -> Bot:
+    # Bot needs a token to construct, but we never call its network methods.
+    return Bot(token="123:TEST")
+
+
+def _text_update(text: str, user_id: int = 7, chat_type: str = "private") -> Update:
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "date": 1_700_000_000,
+                "chat": {"id": user_id, "type": chat_type},
+                "from": {"id": user_id, "is_bot": False, "first_name": "Tester"},
+                "text": text,
+            },
+        },
+        _fake_bot(),
+    )  # type: ignore[return-value]
+
+
+def _photo_update(
+    *,
+    user_id: int = 7,
+    chat_id: int | None = None,
+    chat_type: str = "private",
+    voice: bool = False,
+    caption: str | None = None,
+) -> Update:
+    cid = chat_id if chat_id is not None else user_id
+    msg: dict[str, Any] = {
+        "message_id": 11,
+        "date": 1_700_000_000,
+        "chat": {"id": cid, "type": chat_type},
+        "from": {"id": user_id, "is_bot": False, "first_name": "Tester"},
+        "photo": [
+            {
+                "file_id": "photo-file-id",
+                "file_unique_id": "AQADTEST",
+                "width": 100,
+                "height": 100,
+                "file_size": 1234,
+            }
+        ],
+    }
+    if voice:
+        msg["voice"] = {
+            "file_id": "voice-file-id",
+            "file_unique_id": "AwADTEST",
+            "duration": 3,
+            "mime_type": "audio/ogg",
+            "file_size": 5678,
+        }
+    if caption is not None:
+        msg["caption"] = caption
+    return Update.de_json({"update_id": 2, "message": msg}, _fake_bot())  # type: ignore[return-value]
+
+
+def _callback_update(
+    data: str, user_id: int = 7, chat_id: int = 7, message_id: int = 50
+) -> Update:
+    return Update.de_json(
+        {
+            "update_id": 3,
+            "callback_query": {
+                "id": "cq-1",
+                "from": {"id": user_id, "is_bot": False, "first_name": "Tester"},
+                "chat_instance": "ci-1",
+                "data": data,
+                "message": {
+                    "message_id": message_id,
+                    "date": 1_700_000_000,
+                    "chat": {"id": chat_id, "type": "private"},
+                    "from": {"id": 1, "is_bot": True, "first_name": "Bot"},
+                    "text": "earlier",
+                },
+            },
+        },
+        _fake_bot(),
+    )  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# /start onboarding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_command_in_dm_replies_with_oauth_url(
+    mocks: PipelineMocks,
+) -> None:
+    await expense_pipeline.handle_incoming_message(_text_update("/start", user_id=42))
+
+    assert len(mocks.sent) == 1
+    text = mocks.sent[0].text
+    # The OAuth URL should be in the reply, pointing at the Splitwise
+    # authorize endpoint with a state param.
+    assert "secure.splitwise.com/oauth/authorize" in text
+    assert "state=" in text
+    assert mocks.sent[0].chat_id == 42
+
+
+@pytest.mark.asyncio
+async def test_unknown_dm_text_also_offers_oauth_link(
+    mocks: PipelineMocks,
+) -> None:
+    await expense_pipeline.handle_incoming_message(_text_update("hi there", user_id=11))
+
+    assert len(mocks.sent) == 1
+    assert "splitwise" in mocks.sent[0].text.lower()
+    assert "secure.splitwise.com/oauth/authorize" in mocks.sent[0].text
+
+
+# ---------------------------------------------------------------------------
+# Photo capture
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_photo_from_unconnected_user_prompts_start_and_skips_pipeline(
+    mocks: PipelineMocks,
+) -> None:
+    # No token configured for user 7 — so the pipeline should bail early.
+    await expense_pipeline.handle_incoming_message(_photo_update(user_id=7))
+
+    assert len(mocks.sent) == 1
+    assert "/start" in mocks.sent[0].text
+    # No parser ran, no pending row, no Splitwise client constructed.
+    assert mocks.parser_calls == []
+    assert mocks.created_pendings == []
+    assert mocks.sw_clients_constructed == []
+    assert mocks.downloads == []
+
+
+@pytest.mark.asyncio
+async def test_photo_happy_path_dm(mocks: PipelineMocks) -> None:
+    mocks.tokens[7] = ("plain-token", 555)
+    mocks.users[7] = User(
+        telegram_user_id=7, telegram_username="prem", splitwise_user_id=555
+    )
+
+    await expense_pipeline.handle_incoming_message(_photo_update(user_id=7))
+
+    # Parser was invoked with downloaded bytes.
+    assert len(mocks.parser_calls) == 1
+    image_bytes, transcript, context = mocks.parser_calls[0]
+    assert image_bytes.startswith(b"\xff\xd8\xff")
+    assert transcript is None  # no voice, no caption
+    # DM has no other members.
+    assert context.member_names == []
+    assert context.payer_name == "prem"
+
+    # Pending row was stored with the parsed JSON + a _resolved sidecar.
+    assert len(mocks.created_pendings) == 1
+    saved = mocks.created_pendings[0]
+    assert saved.payer_telegram_user_id == 7
+    assert saved.telegram_group_id is None  # DM
+    assert "_resolved" in saved.parsed_data
+    assert saved.parsed_data["amount"] in {"47.32", 47.32}
+
+    # Confirmation message went out with the inline keyboard.
+    assert len(mocks.sent) == 1
+    out = mocks.sent[0]
+    assert out.reply_markup is not None
+    assert "Trader Joe" in out.text
+
+
+@pytest.mark.asyncio
+async def test_photo_plus_voice_runs_transcribe_then_parse(
+    mocks: PipelineMocks,
+) -> None:
+    mocks.tokens[7] = ("tok", 555)
+    mocks.users[7] = User(
+        telegram_user_id=7, telegram_username="prem", splitwise_user_id=555
+    )
+    mocks.transcript_return = "split this with Priya"
+
+    await expense_pipeline.handle_incoming_message(_photo_update(user_id=7, voice=True))
+
+    # Both photo and voice were downloaded (in either order).
+    assert sorted(mocks.downloads) == ["photo-file-id", "voice-file-id"]
+    # Whisper ran on the voice bytes.
+    assert len(mocks.transcribed) == 1
+    assert mocks.transcribed[0][1] == "audio/ogg"
+    # The parser received the transcript.
+    _img, transcript, _ctx = mocks.parser_calls[0]
+    assert transcript == "split this with Priya"
+
+
+@pytest.mark.asyncio
+async def test_photo_with_caption_uses_caption_when_no_voice(
+    mocks: PipelineMocks,
+) -> None:
+    mocks.tokens[7] = ("tok", 555)
+    mocks.users[7] = User(
+        telegram_user_id=7, telegram_username="prem", splitwise_user_id=555
+    )
+
+    await expense_pipeline.handle_incoming_message(
+        _photo_update(user_id=7, caption="split with Priya 60/40")
+    )
+
+    _img, transcript, _ctx = mocks.parser_calls[0]
+    assert transcript == "split with Priya 60/40"
+
+
+@pytest.mark.asyncio
+async def test_group_photo_records_membership_and_uses_roster(
+    mocks: PipelineMocks,
+) -> None:
+    mocks.tokens[7] = ("tok", 555)
+    mocks.users[7] = User(
+        telegram_user_id=7, telegram_username="prem", splitwise_user_id=555
+    )
+    mocks.group_members[-100] = [
+        mocks.users[7],
+        User(
+            telegram_user_id=8,
+            telegram_username="priya",
+            splitwise_user_id=666,
+        ),
+    ]
+
+    await expense_pipeline.handle_incoming_message(
+        _photo_update(user_id=7, chat_id=-100, chat_type="supergroup")
+    )
+
+    # Membership recorded for the sender + group.
+    assert (7, -100) in mocks.memberships
+    # The parser got the group roster (priya, not "prem" since that's "self").
+    _img, _t, ctx = mocks.parser_calls[0]
+    assert ctx.member_names == ["priya"]
+
+
+@pytest.mark.asyncio
+async def test_group_text_only_message_records_membership_but_stays_quiet(
+    mocks: PipelineMocks,
+) -> None:
+    """Privacy mode means we mostly see @-mentions; we still want the roster."""
+    await expense_pipeline.handle_incoming_message(
+        _text_update("hi", user_id=7, chat_type="supergroup")
+    )
+
+    assert mocks.memberships == [(7, 7)]
+    # No reply (groups stay quiet on plain text we don't act on).
+    assert mocks.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Confirm / cancel / edit callbacks
+# ---------------------------------------------------------------------------
+
+
+async def _seed_pending(mocks: PipelineMocks, *, payer_id: int = 7) -> Any:
+    """Helper: run the capture pipeline once so a pending row exists."""
+    mocks.tokens[payer_id] = ("tok", 555)
+    mocks.users[payer_id] = User(
+        telegram_user_id=payer_id, telegram_username="prem", splitwise_user_id=555
+    )
+    mocks.group_members[payer_id] = [
+        mocks.users[payer_id],
+        User(telegram_user_id=8, telegram_username="priya", splitwise_user_id=666),
+    ]
+    # We run in DM mode so the resolution doesn't depend on group roster.
+    # But the parser already names "Priya" — give her a fake row so the
+    # resolver finds her via group lookup. The capture in DM mode skips
+    # the group roster, so we set splits to ["self", "self"] instead by
+    # patching parsed_expense.
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("20.00"),
+        currency="USD",
+        merchant="Bodega",
+        split_type="equal",
+        splits=[
+            Split(name="self", share=0.5),
+            Split(name="priya", share=0.5),
+        ],
+        confidence=0.9,
+    )
+
+    # Run capture in a group context so the roster is consulted.
+    update = _photo_update(user_id=payer_id, chat_id=-77, chat_type="supergroup")
+    mocks.group_members[-77] = [
+        mocks.users[payer_id],
+        User(telegram_user_id=8, telegram_username="priya", splitwise_user_id=666),
+    ]
+    await expense_pipeline.handle_incoming_message(update)
+    # Grab the pending id from the most recent insert.
+    assert mocks.created_pendings, "capture didn't create a pending row"
+    # The pending id is whichever uuid is in m.pendings.
+    pid = next(iter(mocks.pendings))
+    return pid
+
+
+@pytest.mark.asyncio
+async def test_confirm_tap_creates_splitwise_expense(mocks: PipelineMocks) -> None:
+    pid = await _seed_pending(mocks)
+    # Reset captures from the seed step we don't want polluting assertions.
+    mocks.sent.clear()
+    mocks.edits.clear()
+
+    cb_update = _callback_update(
+        data=f"{keyboards.CONFIRM_PREFIX}:{pid.hex}", user_id=7
+    )
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    # Splitwise client got constructed with the user's token,
+    # create_expense was called with balanced splits, and mark_completed
+    # was invoked with the returned expense id.
+    assert mocks.sw_clients_constructed == ["tok"]
+    assert len(mocks.sw_create_calls) == 1
+    call = mocks.sw_create_calls[0]
+    assert call.cost == Decimal("20.00")
+    assert call.currency == "USD"
+    assert call.description == "Bodega"
+    ids = {s.splitwise_user_id for s in call.splits}
+    assert ids == {555, 666}
+    # mark_completed was called.
+    assert mocks.marked_completed == [(pid, mocks.sw_create_return)]
+    # The message was edited to the success line.
+    assert len(mocks.edits) == 1
+    assert "Added to Splitwise" in mocks.edits[0].text
+
+
+@pytest.mark.asyncio
+async def test_cancel_tap_deletes_pending_and_edits_message(
+    mocks: PipelineMocks,
+) -> None:
+    pid = await _seed_pending(mocks)
+    mocks.sent.clear()
+    mocks.edits.clear()
+
+    cb_update = _callback_update(data=f"{keyboards.CANCEL_PREFIX}:{pid.hex}", user_id=7)
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    assert mocks.deleted_pendings == [pid]
+    assert mocks.sw_create_calls == []
+    assert len(mocks.edits) == 1
+    assert "Cancelled" in mocks.edits[0].text
+
+
+@pytest.mark.asyncio
+async def test_edit_tap_prompts_resend_keeps_pending(
+    mocks: PipelineMocks,
+) -> None:
+    pid = await _seed_pending(mocks)
+    mocks.sent.clear()
+    mocks.edits.clear()
+
+    cb_update = _callback_update(data=f"{keyboards.EDIT_PREFIX}:{pid.hex}", user_id=7)
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    assert pid in mocks.pendings  # NOT deleted
+    assert mocks.deleted_pendings == []
+    assert len(mocks.edits) == 1
+    assert "Send the receipt again" in mocks.edits[0].text
+
+
+@pytest.mark.asyncio
+async def test_confirm_on_missing_pending_replies_friendly_no_crash(
+    mocks: PipelineMocks,
+) -> None:
+    # No seeding — the UUID won't resolve.
+    bogus = uuid4()
+    cb_update = _callback_update(
+        data=f"{keyboards.CONFIRM_PREFIX}:{bogus.hex}", user_id=7
+    )
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    # No Splitwise call, no completion, but the user was told what happened.
+    assert mocks.sw_create_calls == []
+    assert mocks.marked_completed == []
+    assert len(mocks.edits) == 1
+    assert "already handled" in mocks.edits[0].text.lower() or (
+        "expired" in mocks.edits[0].text.lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_by_non_payer_is_rejected(
+    mocks: PipelineMocks,
+) -> None:
+    pid = await _seed_pending(mocks, payer_id=7)
+    mocks.sent.clear()
+    mocks.edits.clear()
+
+    cb_update = _callback_update(
+        data=f"{keyboards.CONFIRM_PREFIX}:{pid.hex}", user_id=999
+    )
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    # No expense was created; the original message was NOT edited.
+    assert mocks.sw_create_calls == []
+    assert mocks.edits == []
+    # A side reply to the non-payer.
+    assert any("only the person" in s.text.lower() for s in mocks.sent)
+
+
+@pytest.mark.asyncio
+async def test_callback_with_unknown_prefix_is_ignored(
+    mocks: PipelineMocks,
+) -> None:
+    cb_update = _callback_update(data="xx:deadbeef", user_id=7)
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    assert mocks.sent == []
+    assert mocks.edits == []
+
+
+@pytest.mark.asyncio
+async def test_callback_with_bad_uuid_is_ignored(mocks: PipelineMocks) -> None:
+    cb_update = _callback_update(data=f"{keyboards.CONFIRM_PREFIX}:nothex", user_id=7)
+    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
+
+    assert mocks.sent == []
+    assert mocks.edits == []

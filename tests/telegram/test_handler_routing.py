@@ -102,38 +102,79 @@ def _mock_answer_callback_query(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Bot, "answer_callback_query", fake_answer)
 
 
+# After Brick F replaced the Phase-1 echo stubs with real dispatch into
+# ``app.services.expense_pipeline``, these tests now verify that the
+# orchestrator entry points get called with the right Update — Brick F's
+# own tests cover what the pipeline then does.
+
+
+@pytest.fixture
+def _stub_orchestrator(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Replace the pipeline entry points with no-op recorders."""
+    captured: dict[str, Any] = {"messages": [], "callbacks": []}
+
+    async def fake_incoming(update: Any) -> None:
+        captured["messages"].append(update)
+
+    async def fake_callback(cq: Any) -> None:
+        captured["callbacks"].append(cq)
+
+    monkeypatch.setattr(
+        "app.services.expense_pipeline.handle_incoming_message", fake_incoming
+    )
+    monkeypatch.setattr("app.services.expense_pipeline.handle_callback", fake_callback)
+    monkeypatch.setattr(
+        "app.telegram.handlers.expense_pipeline.handle_incoming_message",
+        fake_incoming,
+    )
+    monkeypatch.setattr(
+        "app.telegram.handlers.expense_pipeline.handle_callback", fake_callback
+    )
+    return captured
+
+
 def test_text_message_routes_to_text_handler(
-    client: TestClient, sent_messages: list[dict[str, Any]]
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
     resp = client.post("/telegram/webhook", json=_text_update("hi"), headers=_HEADERS)
     assert resp.status_code == 200
-    assert sent_messages == [{"chat_id": 42, "text": "got: hi", "reply_markup": None}]
+    # The orchestrator was invoked with the parsed Update.
+    assert len(_stub_orchestrator["messages"]) == 1
+    msg = _stub_orchestrator["messages"][0].message
+    assert msg is not None and msg.text == "hi"
 
 
 def test_photo_message_routes_to_photo_handler(
-    client: TestClient, sent_messages: list[dict[str, Any]]
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
     resp = client.post("/telegram/webhook", json=_photo_update(), headers=_HEADERS)
     assert resp.status_code == 200
-    assert sent_messages == [
-        {"chat_id": 42, "text": "got a photo", "reply_markup": None}
-    ]
+    assert len(_stub_orchestrator["messages"]) == 1
+    msg = _stub_orchestrator["messages"][0].message
+    assert msg is not None and msg.photo
 
 
 def test_voice_message_routes_to_voice_handler(
-    client: TestClient, sent_messages: list[dict[str, Any]]
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
     resp = client.post("/telegram/webhook", json=_voice_update(), headers=_HEADERS)
     assert resp.status_code == 200
-    assert sent_messages == [
-        {"chat_id": 42, "text": "got a voice note", "reply_markup": None}
-    ]
+    assert len(_stub_orchestrator["messages"]) == 1
+    msg = _stub_orchestrator["messages"][0].message
+    assert msg is not None and msg.voice is not None
 
 
 def test_callback_query_routes_to_callback_handler(
     client: TestClient,
     sent_messages: list[dict[str, Any]],
     _mock_answer_callback_query: None,
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
     resp = client.post(
         "/telegram/webhook",
@@ -141,20 +182,22 @@ def test_callback_query_routes_to_callback_handler(
         headers=_HEADERS,
     )
     assert resp.status_code == 200
-    assert sent_messages == [
-        {"chat_id": 42, "text": "got a tap on cf:deadbeef", "reply_markup": None}
-    ]
+    assert len(_stub_orchestrator["callbacks"]) == 1
+    cq = _stub_orchestrator["callbacks"][0]
+    assert cq.data == "cf:deadbeef"
 
 
 def test_voice_takes_priority_over_text_when_both_present(
-    client: TestClient, sent_messages: list[dict[str, Any]]
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
-    """A voice message may carry an empty text field — voice still wins."""
+    """The router classifies voice messages before text — same Update
+    still produces a single dispatch into the orchestrator."""
     update = _voice_update()
-    # Telegram never sends both, but be defensive about the dispatch order.
     resp = client.post("/telegram/webhook", json=update, headers=_HEADERS)
     assert resp.status_code == 200
-    assert sent_messages[0]["text"] == "got a voice note"
+    assert len(_stub_orchestrator["messages"]) == 1
 
 
 def test_malformed_json_body_returns_200_and_does_not_dispatch(
@@ -193,6 +236,7 @@ def test_empty_allowlist_admits_anyone(
     client: TestClient,
     sent_messages: list[dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
     """Default config has an empty allowlist, so every user is allowed."""
     from app.config import settings
@@ -202,14 +246,16 @@ def test_empty_allowlist_admits_anyone(
         "/telegram/webhook", json=_text_update("hi", chat_id=42), headers=_HEADERS
     )
     assert resp.status_code == 200
-    # Handler ran → echo went out, no rejection message.
-    assert sent_messages == [{"chat_id": 42, "text": "got: hi", "reply_markup": None}]
+    # Handler ran → the orchestrator was invoked, no rejection message.
+    assert sent_messages == []
+    assert len(_stub_orchestrator["messages"]) == 1
 
 
 def test_allowlisted_user_is_admitted(
     client: TestClient,
     sent_messages: list[dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
+    _stub_orchestrator: dict[str, Any],
 ) -> None:
     from app.config import settings
 
@@ -218,9 +264,8 @@ def test_allowlisted_user_is_admitted(
         "/telegram/webhook", json=_text_update("hello", chat_id=42), headers=_HEADERS
     )
     assert resp.status_code == 200
-    assert sent_messages == [
-        {"chat_id": 42, "text": "got: hello", "reply_markup": None}
-    ]
+    assert sent_messages == []
+    assert len(_stub_orchestrator["messages"]) == 1
 
 
 def test_disallowed_user_gets_invite_only_reply_and_no_handler_run(

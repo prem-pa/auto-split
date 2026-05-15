@@ -1,0 +1,731 @@
+"""Brick F — orchestrator.
+
+Glues Bricks B (Telegram), C (Splitwise), D (AI parsing), and E
+(persistence) into a single end-to-end flow:
+
+    photo (+ optional voice/caption) → parse → confirmation message →
+    confirm tap → Splitwise.createExpense → "Added to Splitwise ✓".
+
+This module is a leaf: nothing in the rest of the app imports from it.
+The Telegram webhook (Brick B) calls :func:`handle_incoming_message` and
+:func:`handle_callback`; everything else happens here.
+
+Privacy:
+    Never log Splitwise tokens, OAuth codes, image bytes, voice bytes,
+    or the transcript text. ``telegram_user_id`` and pending UUIDs are
+    fine.
+"""
+
+from __future__ import annotations
+
+import logging
+from decimal import ROUND_HALF_UP, Decimal
+from uuid import UUID
+
+from telegram import CallbackQuery, Update
+
+from app.ai import (
+    ParsedExpense,
+    ParserError,
+    TranscriptionError,
+    default_parser,
+    transcribe_voice,
+)
+from app.db.expenses import (
+    PendingNotFoundError,
+    create_pending,
+    delete_pending,
+    get_pending,
+    mark_completed,
+)
+from app.db.groups import list_group_members, record_membership
+from app.services.group_context import (
+    ResolvedSplit,
+    UNRESOLVED,
+    build_group_context,
+    resolve_split_names,
+)
+from app.splitwise import (
+    Split as SwSplit,
+    SplitwiseAPIError,
+    SplitwiseClient,
+    build_auth_url,
+    load_user_token,
+    mint_state,
+)
+from app.telegram import bot as _tg_bot
+from app.telegram import files as _tg_files
+from app.telegram import keyboards
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+
+async def handle_incoming_message(update: Update) -> None:
+    """Top-level message router (DMs and groups, not callbacks).
+
+    Routes:
+        * Photo (with or without caption / voice) → expense capture.
+        * Plain text starting with ``/start`` (DM only) → OAuth onboarding.
+        * Anything else in a DM → friendly /start nudge.
+        * Anything else in a group → record membership and stay quiet.
+    """
+    message = update.message
+    if message is None:
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    if user is None or chat is None:
+        # No way to act without a sender or chat; this should be
+        # impossible for messages we care about.
+        return
+
+    is_private = chat.type == "private"
+    telegram_user_id = user.id
+    chat_id = chat.id
+
+    # Always remember the sender exists in this group, regardless of
+    # whether the message itself triggers a capture flow.
+    if not is_private:
+        try:
+            await record_membership(telegram_user_id, chat_id)
+        except Exception:  # noqa: BLE001 — best-effort; never crash dispatch
+            log.exception(
+                "record_membership failed for telegram_user_id=%s chat=%s",
+                telegram_user_id,
+                chat_id,
+            )
+
+    # Photo (+ optional voice) drives the capture pipeline.
+    if message.photo:
+        await _process_expense_capture(update)
+        return
+
+    # Voice alone is not a capture (we need a receipt photo). Tell DMs;
+    # stay quiet in groups so we don't spam.
+    if message.voice is not None:
+        if is_private:
+            await _safe_send(
+                chat_id,
+                "Send me a photo of the receipt (you can add a voice note too).",
+            )
+        return
+
+    # Text-only messages in a DM: handle /start and any unknown text.
+    if is_private and message.text is not None:
+        await _handle_dm_text(telegram_user_id, chat_id, message.text)
+        return
+
+    # Group text without a photo: nothing to do. Privacy mode means we
+    # mostly get @mentions, so just stay quiet.
+
+
+async def handle_callback(callback_query: CallbackQuery) -> None:
+    """Dispatch an inline-keyboard tap based on its ``callback_data`` prefix.
+
+    Always answers the callback (clears the spinner) before doing the
+    real work — Telegram only gives the bot ~5s before the client gives
+    up on the loading state.
+    """
+    data = callback_query.data or ""
+    user = callback_query.from_user
+    if user is None:
+        log.warning("callback without from_user: data=%r", data)
+        return
+    telegram_user_id = user.id
+
+    # Best-effort spinner clear; never let this kill the handler.
+    try:
+        await callback_query.answer()
+    except Exception:  # noqa: BLE001
+        log.exception("callback_query.answer() failed")
+
+    # callback_data shape: "<prefix>:<uuid_hex>". Anything else is
+    # ignored.
+    if ":" not in data:
+        log.info("callback ignored: unparseable data=%r", data)
+        return
+    prefix, _, hex_id = data.partition(":")
+    try:
+        pending_id = UUID(hex=hex_id)
+    except ValueError:
+        log.info("callback ignored: bad uuid hex=%r", hex_id)
+        return
+
+    message = callback_query.message
+    chat_id = message.chat_id if message is not None else None
+    message_id = message.message_id if message is not None else None
+
+    if prefix == keyboards.CONFIRM_PREFIX:
+        await handle_confirm(pending_id, telegram_user_id, chat_id, message_id)
+    elif prefix == keyboards.CANCEL_PREFIX:
+        await handle_cancel(pending_id, telegram_user_id, chat_id, message_id)
+    elif prefix == keyboards.EDIT_PREFIX:
+        await handle_edit(pending_id, telegram_user_id, chat_id, message_id)
+    else:
+        log.info("callback ignored: unknown prefix=%r", prefix)
+
+
+# ---------------------------------------------------------------------------
+# DM text → onboarding
+# ---------------------------------------------------------------------------
+
+
+async def _handle_dm_text(telegram_user_id: int, chat_id: int, text: str) -> None:
+    """Reply with the user's personalised Splitwise OAuth link.
+
+    For v1, every text-only DM gets the OAuth link — that lowers the
+    barrier and means typos like ``/sart`` still help. We intentionally
+    don't try to detect /help, /status, etc. here; that's Phase 6.
+    """
+    stripped = text.strip()
+    try:
+        url = build_auth_url(mint_state(telegram_user_id))
+    except RuntimeError as exc:
+        log.exception(
+            "build_auth_url failed for telegram_user_id=%s: %s",
+            telegram_user_id,
+            exc,
+        )
+        await _safe_send(
+            chat_id,
+            "Something is misconfigured on my side — please ping the bot owner.",
+        )
+        return
+
+    if stripped.startswith("/start"):
+        intro = (
+            "Welcome! I'm udhaari — I add expenses to Splitwise for you.\n\n"
+            "Step 1: connect your Splitwise account using the link below.\n"
+            "Step 2: send a receipt photo (in a DM or in a group with me) "
+            "and I'll do the rest.\n\n"
+            f"Connect Splitwise: {url}"
+        )
+    else:
+        intro = (
+            "Hi! DM me a receipt photo and I'll add it to Splitwise.\n"
+            f"To connect your Splitwise account, open: {url}"
+        )
+    await _safe_send(chat_id, intro)
+
+
+# ---------------------------------------------------------------------------
+# Capture pipeline
+# ---------------------------------------------------------------------------
+
+
+async def _process_expense_capture(update: Update) -> None:
+    """Photo → parse → store pending → post confirmation.
+
+    Errors at any step are surfaced as a short user-visible message and
+    swallowed so the webhook still returns 200.
+    """
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    # Caller (handle_incoming_message) guarantees these are non-None and
+    # that the message has at least one photo; assert defensively anyway
+    # for type-checkers.
+    assert message is not None and message.photo
+    assert user is not None and chat is not None
+
+    telegram_user_id = user.id
+    chat_id = chat.id
+    is_private = chat.type == "private"
+    telegram_group_id = None if is_private else chat_id
+
+    # 1. Token / connection check.
+    token_record = await load_user_token(telegram_user_id)
+    if token_record is None:
+        log.info(
+            "capture: unconnected user telegram_user_id=%s chat=%s",
+            telegram_user_id,
+            chat_id,
+        )
+        await _safe_send(
+            chat_id,
+            "I don't see a Splitwise connection for you yet. DM me /start "
+            "and I'll send you a link to connect.",
+        )
+        return
+    payer_token, payer_splitwise_user_id = token_record
+
+    # 2. Build context for the parser.
+    try:
+        context = await build_group_context(telegram_group_id, telegram_user_id)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "build_group_context failed telegram_user_id=%s", telegram_user_id
+        )
+        await _safe_send(chat_id, "Something went wrong loading your group. Try again?")
+        return
+
+    # 3. Download photo + (optional) voice.
+    photo = message.photo[-1]  # largest size last
+    try:
+        image_bytes = await _tg_files.download_telegram_file(photo.file_id)
+    except Exception:  # noqa: BLE001
+        log.exception("download photo failed telegram_user_id=%s", telegram_user_id)
+        await _safe_send(
+            chat_id, "I couldn't fetch your photo from Telegram. Try again?"
+        )
+        return
+
+    transcript: str | None = None
+    voice = message.voice
+    if voice is not None:
+        try:
+            audio_bytes = await _tg_files.download_telegram_file(voice.file_id)
+            transcript = await transcribe_voice(
+                audio_bytes, voice.mime_type or "audio/ogg"
+            )
+        except TranscriptionError:
+            log.warning("transcribe_voice failed telegram_user_id=%s", telegram_user_id)
+            # Don't block the capture: a missing transcript just means the
+            # parser does its best from the photo + caption alone.
+            transcript = None
+        except Exception:  # noqa: BLE001
+            log.exception("download voice failed telegram_user_id=%s", telegram_user_id)
+            transcript = None
+
+    # Use the photo caption as a fallback / supplement when there's no
+    # voice transcript (Telegram lets users add a text caption to a photo).
+    if not transcript and message.caption:
+        transcript = message.caption
+
+    # 4. Parse with Brick D.
+    try:
+        parsed = await default_parser().parse(image_bytes, transcript, context)
+    except ParserError:
+        log.warning(
+            "parser failed telegram_user_id=%s chat=%s",
+            telegram_user_id,
+            chat_id,
+        )
+        await _safe_send(
+            chat_id,
+            "I couldn't read that receipt clearly. Try a sharper photo?",
+        )
+        return
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "parser raised telegram_user_id=%s chat=%s",
+            telegram_user_id,
+            chat_id,
+        )
+        await _safe_send(chat_id, "Something went wrong parsing the receipt.")
+        return
+
+    # 5. Resolve split names against the actual group roster.
+    members_for_resolution = (
+        await list_group_members(telegram_group_id)
+        if telegram_group_id is not None
+        else []
+    )
+    resolved = resolve_split_names(
+        parsed.splits,
+        members_for_resolution,
+        payer_telegram_user_id=telegram_user_id,
+        payer_splitwise_user_id=payer_splitwise_user_id,
+    )
+
+    # 6. Persist a pending row. The parsed JSON is the source of truth
+    # for the confirm step. We serialise via Pydantic's JSON mode so
+    # ``Decimal`` becomes a number (Supabase JSONB accepts that).
+    parsed_data = parsed.model_dump(mode="json")
+    parsed_data["_resolved"] = [
+        {
+            "name": r.name,
+            "share": r.share,
+            "telegram_user_id": r.telegram_user_id,
+            "splitwise_user_id": r.splitwise_user_id,
+            "ambiguous": r.ambiguous,
+        }
+        for r in resolved
+    ]
+
+    try:
+        pending = await create_pending(
+            telegram_message_id=message.message_id,
+            telegram_group_id=telegram_group_id,
+            payer_telegram_user_id=telegram_user_id,
+            parsed_data=parsed_data,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("create_pending failed telegram_user_id=%s", telegram_user_id)
+        await _safe_send(chat_id, "I couldn't save the draft. Try again?")
+        return
+
+    # 7. Post confirmation message.
+    text = _format_confirmation_text(parsed, resolved)
+    try:
+        await _tg_bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboards.confirmation_keyboard(pending.id),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "send confirmation failed pending=%s telegram_user_id=%s",
+            pending.id,
+            telegram_user_id,
+        )
+
+    log.info(
+        "capture.ok pending=%s telegram_user_id=%s chat=%s",
+        pending.id,
+        telegram_user_id,
+        chat_id,
+    )
+
+
+def _format_confirmation_text(
+    parsed: ParsedExpense, resolved: list[ResolvedSplit]
+) -> str:
+    """Build the short confirmation summary shown alongside the buttons.
+
+    Kept deliberately compact — Telegram clients clip long messages and
+    the keyboard rows below are what the user is here for.
+    """
+    lines: list[str] = []
+    merchant = parsed.merchant or "(unknown merchant)"
+    lines.append(f"{merchant} — {parsed.amount} {parsed.currency}")
+    if parsed.split_type != "equal":
+        lines.append(f"Split type: {parsed.split_type}")
+
+    for r in resolved:
+        pct = f"{r.share * 100:.0f}%"
+        if r.ambiguous:
+            label = f"{r.name} (ambiguous — please verify)"
+        elif r.telegram_user_id == UNRESOLVED:
+            label = f"{r.name} (not in this group yet)"
+        else:
+            label = r.name
+        lines.append(f"  • {label}: {pct}")
+    lines.append("\nConfirm to add to Splitwise.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Callback handlers
+# ---------------------------------------------------------------------------
+
+
+async def handle_confirm(
+    pending_id: UUID,
+    telegram_user_id: int,
+    chat_id: int | None,
+    message_id: int | None,
+) -> None:
+    """Confirm tap: load pending → POST to Splitwise → mark completed."""
+    pending = await get_pending(pending_id)
+    if pending is None:
+        await _edit_or_send(
+            chat_id,
+            message_id,
+            "This expense was already handled or has expired.",
+        )
+        return
+
+    # Idempotency: if a different user tapped the keyboard, refuse.
+    if (
+        pending.payer_telegram_user_id is not None
+        and pending.payer_telegram_user_id != telegram_user_id
+    ):
+        log.info(
+            "confirm rejected: tapper=%s != payer=%s pending=%s",
+            telegram_user_id,
+            pending.payer_telegram_user_id,
+            pending_id,
+        )
+        # Don't edit the message; just send a side reply so the original
+        # sender can still confirm.
+        if chat_id is not None:
+            await _safe_send(
+                chat_id, "Only the person who sent the receipt can confirm it."
+            )
+        return
+
+    token_record = await load_user_token(telegram_user_id)
+    if token_record is None:
+        await _edit_or_send(
+            chat_id,
+            message_id,
+            "You're not connected to Splitwise. DM me /start.",
+        )
+        return
+    plain_token, _payer_swid = token_record
+
+    # Re-hydrate the parsed expense + resolved splits from the pending row.
+    parsed_data = pending.parsed_data or {}
+    resolved_meta: list[dict[str, object]] = list(
+        parsed_data.get("_resolved", []) or []
+    )
+
+    try:
+        parsed = ParsedExpense.model_validate(
+            {k: v for k, v in parsed_data.items() if k != "_resolved"}
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("confirm: parsed_data invalid pending=%s", pending_id)
+        await _edit_or_send(
+            chat_id, message_id, "The draft for this expense was corrupted."
+        )
+        return
+
+    sw_splits = _build_sw_splits(parsed, resolved_meta)
+    if not sw_splits:
+        await _edit_or_send(
+            chat_id,
+            message_id,
+            "I couldn't match all participants to Splitwise users. Ask them to "
+            "DM me /start first, then resend.",
+        )
+        return
+
+    client = SplitwiseClient(plain_token)
+    description = parsed.merchant or "Expense"
+    try:
+        sw_expense_id = await client.create_expense(
+            cost=parsed.amount,
+            currency=parsed.currency,
+            description=description,
+            group_id=None,
+            splits=sw_splits,
+        )
+    except SplitwiseAPIError:
+        log.warning(
+            "splitwise create_expense failed pending=%s telegram_user_id=%s",
+            pending_id,
+            telegram_user_id,
+        )
+        await _edit_or_send(
+            chat_id,
+            message_id,
+            "Splitwise rejected the expense. Try again, or add it in the app.",
+        )
+        return
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "splitwise create_expense raised pending=%s telegram_user_id=%s",
+            pending_id,
+            telegram_user_id,
+        )
+        await _edit_or_send(
+            chat_id,
+            message_id,
+            "Couldn't reach Splitwise right now. Try again in a minute.",
+        )
+        return
+
+    try:
+        await mark_completed(pending_id, sw_expense_id)
+    except PendingNotFoundError:
+        # Highly unlikely (we just read it), but a sweep could fire between
+        # get_pending and mark_completed. The expense is already in
+        # Splitwise; we just can't reflect it back.
+        log.warning(
+            "pending vanished before mark_completed pending=%s sw_expense=%s",
+            pending_id,
+            sw_expense_id,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "mark_completed failed pending=%s sw_expense=%s",
+            pending_id,
+            sw_expense_id,
+        )
+
+    await _edit_or_send(chat_id, message_id, "Added to Splitwise ✓")
+    log.info(
+        "confirm.ok pending=%s sw_expense=%s telegram_user_id=%s",
+        pending_id,
+        sw_expense_id,
+        telegram_user_id,
+    )
+
+
+async def handle_cancel(
+    pending_id: UUID,
+    telegram_user_id: int,
+    chat_id: int | None,
+    message_id: int | None,
+) -> None:
+    """Cancel tap: delete the pending row and edit the message."""
+    pending = await get_pending(pending_id)
+    if pending is None:
+        await _edit_or_send(
+            chat_id, message_id, "This expense was already handled or has expired."
+        )
+        return
+    if (
+        pending.payer_telegram_user_id is not None
+        and pending.payer_telegram_user_id != telegram_user_id
+    ):
+        if chat_id is not None:
+            await _safe_send(
+                chat_id, "Only the person who sent the receipt can cancel it."
+            )
+        return
+
+    try:
+        await delete_pending(pending_id)
+    except Exception:  # noqa: BLE001
+        log.exception("delete_pending failed pending=%s", pending_id)
+        # Fall through and still tell the user it's cancelled — TTL
+        # will eventually clean it up.
+
+    await _edit_or_send(chat_id, message_id, "Cancelled.")
+    log.info("cancel.ok pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
+
+
+async def handle_edit(
+    pending_id: UUID,
+    telegram_user_id: int,
+    chat_id: int | None,
+    message_id: int | None,
+) -> None:
+    """Edit tap: tell the user to resend; pending is left for TTL.
+
+    v1 is intentionally dumb — per the handoff doc, per-field edit is a
+    Phase 6 concern. We don't delete the pending row so the user has a
+    window to come back and confirm if they change their mind.
+    """
+    pending = await get_pending(pending_id)
+    if pending is None:
+        await _edit_or_send(
+            chat_id, message_id, "This expense was already handled or has expired."
+        )
+        return
+    if (
+        pending.payer_telegram_user_id is not None
+        and pending.payer_telegram_user_id != telegram_user_id
+    ):
+        if chat_id is not None:
+            await _safe_send(
+                chat_id, "Only the person who sent the receipt can edit it."
+            )
+        return
+
+    await _edit_or_send(
+        chat_id,
+        message_id,
+        "Send the receipt again with what you'd like to change.",
+    )
+    log.info("edit.prompt pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_sw_splits(
+    parsed: ParsedExpense, resolved_meta: list[dict[str, object]]
+) -> list[SwSplit]:
+    """Convert resolved splits into balanced :class:`Split` objects.
+
+    Splitwise requires each user's ``paid_share`` and ``owed_share`` to
+    sum to the expense total. We assume the payer paid the full amount
+    (the common case for "I bought this, split it with X"); per-user
+    paid_share allocations are a Phase 6 concern.
+
+    Returns an empty list if any participant doesn't have a
+    ``splitwise_user_id`` (i.e. they haven't connected) or is marked as
+    :data:`UNRESOLVED` — the caller should ask the user to resolve.
+    """
+    if not resolved_meta:
+        return []
+
+    total = Decimal(str(parsed.amount))
+    # Build a tentative list and bail if any participant is unusable.
+    tentative: list[tuple[int, float]] = []
+    for meta in resolved_meta:
+        sw_id = meta.get("splitwise_user_id")
+        if not isinstance(sw_id, int) or sw_id == 0:
+            return []
+        share = meta.get("share")
+        if not isinstance(share, int | float):
+            return []
+        tentative.append((sw_id, float(share)))
+
+    # Compute owed_share per user as ``total * share`` rounded to cents.
+    cents = (total * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    raw_owed: list[Decimal] = []
+    for _sw_id, share in tentative:
+        sub = (cents * Decimal(str(share))).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+        raw_owed.append(sub)
+
+    # Reconcile rounding drift: ensure sum(raw_owed) == cents exactly.
+    drift = cents - sum(raw_owed, Decimal(0))
+    if drift != 0 and raw_owed:
+        # Apply the drift to the first participant (typically the payer
+        # since "self" is usually emitted first).
+        raw_owed[0] += drift
+
+    splits: list[SwSplit] = []
+    payer_sw_id = tentative[0][0]
+    for (sw_id, _share), owed_cents in zip(tentative, raw_owed, strict=True):
+        owed = (owed_cents / Decimal(100)).quantize(Decimal("0.01"))
+        paid = total if sw_id == payer_sw_id else Decimal("0.00")
+        splits.append(
+            SwSplit(
+                splitwise_user_id=sw_id,
+                paid_share=paid,
+                owed_share=owed,
+            )
+        )
+    return splits
+
+
+async def _safe_send(chat_id: int, text: str) -> None:
+    """``send_message`` that swallows transport errors.
+
+    Used in error paths where we can't usefully recover from a failed
+    Telegram round-trip — the user just won't see our message.
+    """
+    try:
+        await _tg_bot.send_message(chat_id=chat_id, text=text)
+    except Exception:  # noqa: BLE001
+        log.exception("send_message failed chat=%s", chat_id)
+
+
+async def _edit_or_send(
+    chat_id: int | None,
+    message_id: int | None,
+    text: str,
+) -> None:
+    """Try to edit the original confirmation; fall back to a new message.
+
+    The keyboard is stripped on edit so the user can't tap a stale button.
+    """
+    if chat_id is None or message_id is None:
+        return
+    try:
+        await _tg_bot.edit_message(
+            chat_id=chat_id, message_id=message_id, text=text, reply_markup=None
+        )
+        return
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "edit_message failed chat=%s message=%s; falling back to send",
+            chat_id,
+            message_id,
+        )
+    await _safe_send(chat_id, text)
+
+
+__all__ = [
+    "handle_callback",
+    "handle_cancel",
+    "handle_confirm",
+    "handle_edit",
+    "handle_incoming_message",
+]

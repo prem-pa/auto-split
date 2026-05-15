@@ -23,13 +23,19 @@ TEST_WEBHOOK_SECRET = "test-webhook-secret-do-not-use"
 
 @pytest.fixture(autouse=True)
 def _patch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Force test-only secrets onto the global ``settings`` singleton."""
+    """Force test-only secrets onto the global ``settings`` singleton.
+
+    Also resets the allowlist to empty so dispatch tests don't accidentally
+    inherit the developer's local ``TELEGRAM_ALLOWED_USER_IDS`` from .env.
+    Tests that exercise the allowlist behaviour override this explicitly.
+    """
     from app.config import settings
 
     monkeypatch.setattr(settings, "telegram_bot_token", SecretStr(TEST_BOT_TOKEN))
     monkeypatch.setattr(
         settings, "telegram_webhook_secret", SecretStr(TEST_WEBHOOK_SECRET)
     )
+    monkeypatch.setattr(settings, "telegram_allowed_user_ids", [])
 
 
 @pytest.fixture(autouse=True)
