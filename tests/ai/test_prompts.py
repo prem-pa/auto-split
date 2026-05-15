@@ -30,7 +30,24 @@ def test_user_prompt_handles_missing_transcript() -> None:
         payer_name="Prem", member_names=["Priya"], default_currency="USD"
     )
     prompt = build_user_prompt(None, ctx)
-    assert "no voice note" in prompt.lower() or "no text" in prompt.lower()
+    assert "no instruction" in prompt.lower()
+
+
+def test_user_prompt_includes_image_provided_note_by_default() -> None:
+    ctx = GroupContext(payer_name="Prem", member_names=[], default_currency="USD")
+    prompt = build_user_prompt("dinner", ctx)
+    # has_image defaults to True.
+    assert (
+        "image: provided" in prompt.lower()
+        or "receipt image: provided" in prompt.lower()
+    )
+
+
+def test_user_prompt_flags_no_image_when_text_only() -> None:
+    ctx = GroupContext(payer_name="Prem", member_names=[], default_currency="USD")
+    prompt = build_user_prompt("I paid $20", ctx, has_image=False)
+    assert "not provided" in prompt.lower()
+    assert "user instruction" in prompt.lower()
 
 
 def test_user_prompt_handles_empty_member_list() -> None:

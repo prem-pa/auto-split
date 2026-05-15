@@ -91,11 +91,15 @@ async def _capture_user_identity(user: Any) -> None:
 async def handle_incoming_message(update: Update) -> None:
     """Top-level message router (DMs and groups, not callbacks).
 
-    Routes:
-        * Photo (with or without caption / voice) → expense capture.
-        * Plain text starting with ``/start`` (DM only) → OAuth onboarding.
-        * Anything else in a DM → friendly /start nudge.
-        * Anything else in a group → record membership and stay quiet.
+    Decision tree:
+        * Photo (with or without voice/caption)        → photo capture pipeline.
+        * Text starting with ``/start``                → OAuth onboarding (handles
+                                                         already-connected case too).
+        * Voice or text from a CONNECTED user          → text-only capture (parser
+                                                         runs without an image; low
+                                                         confidence asks for more).
+        * Anything from an UNCONNECTED user in a DM    → friendly OAuth nudge.
+        * Anything from an UNCONNECTED user in a group → stay quiet (don't spam).
     """
     message = update.message
     if message is None:
@@ -128,28 +132,44 @@ async def handle_incoming_message(update: Update) -> None:
                 chat_id,
             )
 
-    # Photo (+ optional voice) drives the capture pipeline.
+    # Photo (+ optional voice/caption) drives the photo capture pipeline.
     if message.photo:
         await _process_expense_capture(update)
         return
 
-    # Voice alone is not a capture (we need a receipt photo). Tell DMs;
-    # stay quiet in groups so we don't spam.
-    if message.voice is not None:
+    text = (message.text or "").strip() if message.text else ""
+
+    # ``/start`` is special: it's the onboarding entry point. Handle it
+    # before any token check so unconnected users see the OAuth link and
+    # connected users get a friendly "you're already in".
+    if text.startswith("/start"):
+        await _handle_start_command(telegram_user_id, chat_id)
+        return
+
+    # Anything else requires a connected user. Look up once and branch.
+    token_record = await load_user_token(telegram_user_id)
+    if token_record is None:
         if is_private:
-            await _safe_send(
-                chat_id,
-                "Send me a photo of the receipt (you can add a voice note too).",
-            )
+            await _handle_unconnected_dm(telegram_user_id, chat_id)
+        # Group: deliberately silent so we don't expose someone's
+        # disconnected state in front of everyone.
         return
 
-    # Text-only messages in a DM: handle /start and any unknown text.
-    if is_private and message.text is not None:
-        await _handle_dm_text(telegram_user_id, chat_id, message.text)
+    # Voice without a photo → transcribe → text-only capture.
+    if message.voice is not None:
+        await _process_voice_only_capture(
+            update, voice=message.voice, token_record=token_record
+        )
         return
 
-    # Group text without a photo: nothing to do. Privacy mode means we
-    # mostly get @mentions, so just stay quiet.
+    # Text without a photo → try text-only capture.
+    if text:
+        await _process_text_only_capture(
+            update, text_input=text, token_record=token_record
+        )
+        return
+
+    # Empty / non-text / non-media message — stay quiet.
 
 
 async def handle_callback(callback_query: CallbackQuery) -> None:
@@ -202,20 +222,32 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# DM text → onboarding
+# Onboarding helpers
 # ---------------------------------------------------------------------------
 
+# Sent when the user gives us so little to work with that we can't even
+# guess at an expense (low parser confidence, empty transcript, etc.).
+_NOT_ENOUGH_INFO_HINT = (
+    "I didn't get enough to record an expense. Try something like:\n"
+    '  • "I paid $24.50 at Trader Joe\'s, split equally with Shreya"\n'
+    '  • "Dinner was 60 dollars, split 2:1 with Hardik"\n'
+    "Or send a photo of the receipt and I'll read it for you."
+)
 
-async def _handle_dm_text(telegram_user_id: int, chat_id: int, text: str) -> None:
-    """Reply with the user's personalised Splitwise OAuth link.
+# Floor for parser confidence on text-only / voice-only captures. Below
+# this we don't bother the user with a confirmation — we ask them to add
+# more detail instead.
+_TEXT_CAPTURE_CONFIDENCE_FLOOR = 0.3
 
-    For v1, every text-only DM gets the OAuth link — that lowers the
-    barrier and means typos like ``/sart`` still help. We intentionally
-    don't try to detect /help, /status, etc. here; that's Phase 6.
+
+async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
+    """Mint a state token and return the user's personalised OAuth URL.
+
+    Returns ``None`` after sending a user-visible error if Splitwise
+    credentials aren't configured (the orchestrator can't recover).
     """
-    stripped = text.strip()
     try:
-        url = build_auth_url(mint_state(telegram_user_id))
+        return build_auth_url(mint_state(telegram_user_id))
     except RuntimeError as exc:
         log.exception(
             "build_auth_url failed for telegram_user_id=%s: %s",
@@ -226,22 +258,51 @@ async def _handle_dm_text(telegram_user_id: int, chat_id: int, text: str) -> Non
             chat_id,
             "Something is misconfigured on my side — please ping the bot owner.",
         )
+        return None
+
+
+async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
+    """Handle ``/start`` for both unconnected and already-connected users.
+
+    Unconnected → welcome + OAuth link.
+    Connected   → friendly "you're already in, here's what to do" message.
+    """
+    token_record = await load_user_token(telegram_user_id)
+    if token_record is not None:
+        # Already authenticated. Don't send another OAuth link — that's
+        # the bug this commit fixes.
+        await _safe_send(
+            chat_id,
+            "You're already connected to Splitwise. ✓\n\n"
+            "Send me a receipt photo, or describe the expense in text "
+            '(e.g. "I paid $24 at Trader Joe\'s, split with Shreya").',
+        )
         return
 
-    if stripped.startswith("/start"):
-        intro = (
-            "Welcome! I'm udhaari — I add expenses to Splitwise for you.\n\n"
-            "Step 1: connect your Splitwise account using the link below.\n"
-            "Step 2: send a receipt photo (in a DM or in a group with me) "
-            "and I'll do the rest.\n\n"
-            f"Connect Splitwise: {url}"
-        )
-    else:
-        intro = (
-            "Hi! DM me a receipt photo and I'll add it to Splitwise.\n"
-            f"To connect your Splitwise account, open: {url}"
-        )
-    await _safe_send(chat_id, intro)
+    url = await _build_oauth_url(telegram_user_id, chat_id)
+    if url is None:
+        return
+    await _safe_send(
+        chat_id,
+        "Welcome! I'm udhaari — I add expenses to Splitwise for you.\n\n"
+        "Step 1: connect your Splitwise account using the link below.\n"
+        "Step 2: send a receipt photo, or describe the expense in text, "
+        "and I'll do the rest.\n\n"
+        f"Connect Splitwise: {url}",
+    )
+
+
+async def _handle_unconnected_dm(telegram_user_id: int, chat_id: int) -> None:
+    """A DM from someone who hasn't OAuth'd yet — send them the link."""
+    url = await _build_oauth_url(telegram_user_id, chat_id)
+    if url is None:
+        return
+    await _safe_send(
+        chat_id,
+        "Hi! DM me a receipt photo (or describe the expense in text) and "
+        "I'll add it to Splitwise.\n"
+        f"First, connect your Splitwise account: {url}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +344,7 @@ async def _process_expense_capture(update: Update) -> None:
             "and I'll send you a link to connect.",
         )
         return
-    payer_token, payer_splitwise_user_id = token_record
+    _payer_token, payer_splitwise_user_id = token_record
 
     # 2. Build context for the parser.
     try:
@@ -351,7 +412,150 @@ async def _process_expense_capture(update: Update) -> None:
         await _safe_send(chat_id, "Something went wrong parsing the receipt.")
         return
 
-    # 5. Resolve split names against the actual group roster.
+    # 5-7. Common: resolve, persist, post confirmation.
+    await _finalize_capture(
+        parsed=parsed,
+        message=message,
+        telegram_user_id=telegram_user_id,
+        chat_id=chat_id,
+        telegram_group_id=telegram_group_id,
+        payer_splitwise_user_id=payer_splitwise_user_id,
+    )
+
+
+async def _process_text_only_capture(
+    update: Update,
+    *,
+    text_input: str,
+    token_record: tuple[str, int],
+) -> None:
+    """Capture an expense from text alone (no photo).
+
+    Used for two entry points:
+      * DM text from a connected user.
+      * @-mention text in a group from a connected user (no photo, no voice).
+
+    Low parser confidence triggers a "not enough info" reply instead of
+    a confirmation — we don't want to fabricate an expense from "hi".
+    """
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    assert message is not None and user is not None and chat is not None
+
+    telegram_user_id = user.id
+    chat_id = chat.id
+    is_private = chat.type == "private"
+    telegram_group_id = None if is_private else chat_id
+    _payer_token, payer_splitwise_user_id = token_record
+
+    try:
+        context = await build_group_context(telegram_group_id, telegram_user_id)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "build_group_context failed telegram_user_id=%s", telegram_user_id
+        )
+        await _safe_send(chat_id, "Something went wrong loading your group. Try again?")
+        return
+
+    try:
+        parsed = await default_parser().parse(b"", text_input, context)
+    except ParserError:
+        log.info(
+            "text-only parser gave up telegram_user_id=%s chat=%s",
+            telegram_user_id,
+            chat_id,
+        )
+        await _safe_send(chat_id, _NOT_ENOUGH_INFO_HINT)
+        return
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "text-only parser raised telegram_user_id=%s chat=%s",
+            telegram_user_id,
+            chat_id,
+        )
+        await _safe_send(chat_id, "Something went wrong parsing that.")
+        return
+
+    if parsed.confidence < _TEXT_CAPTURE_CONFIDENCE_FLOOR:
+        log.info(
+            "text-only low confidence telegram_user_id=%s confidence=%.2f",
+            telegram_user_id,
+            parsed.confidence,
+        )
+        await _safe_send(chat_id, _NOT_ENOUGH_INFO_HINT)
+        return
+
+    await _finalize_capture(
+        parsed=parsed,
+        message=message,
+        telegram_user_id=telegram_user_id,
+        chat_id=chat_id,
+        telegram_group_id=telegram_group_id,
+        payer_splitwise_user_id=payer_splitwise_user_id,
+    )
+
+
+async def _process_voice_only_capture(
+    update: Update,
+    *,
+    voice: Any,
+    token_record: tuple[str, int],
+) -> None:
+    """Voice without photo → Whisper → text-only capture path."""
+    message = update.message
+    user = update.effective_user
+    chat = update.effective_chat
+    assert message is not None and user is not None and chat is not None
+
+    chat_id = chat.id
+    telegram_user_id = user.id
+
+    try:
+        audio_bytes = await _tg_files.download_telegram_file(voice.file_id)
+    except Exception:  # noqa: BLE001
+        log.exception("download voice failed telegram_user_id=%s", telegram_user_id)
+        await _safe_send(chat_id, "Couldn't fetch your voice note. Try again?")
+        return
+
+    try:
+        transcript = await transcribe_voice(audio_bytes, voice.mime_type or "audio/ogg")
+    except TranscriptionError:
+        log.warning("transcribe_voice failed telegram_user_id=%s", telegram_user_id)
+        await _safe_send(
+            chat_id, "I couldn't transcribe that. Try again, or type the details."
+        )
+        return
+    except Exception:  # noqa: BLE001
+        log.exception("transcribe_voice raised telegram_user_id=%s", telegram_user_id)
+        await _safe_send(chat_id, "Something went wrong with your voice note.")
+        return
+
+    if not transcript.strip():
+        await _safe_send(chat_id, _NOT_ENOUGH_INFO_HINT)
+        return
+
+    await _process_text_only_capture(
+        update, text_input=transcript, token_record=token_record
+    )
+
+
+async def _finalize_capture(
+    *,
+    parsed: ParsedExpense,
+    message: Any,
+    telegram_user_id: int,
+    chat_id: int,
+    telegram_group_id: int | None,
+    payer_splitwise_user_id: int,
+) -> None:
+    """Common tail of every capture flow: resolve → persist → confirm.
+
+    Whether the parse came from a photo, voice transcript, or typed text,
+    the steps from here on are identical: match names to group members,
+    save a pending row, and post the inline-keyboard confirmation.
+    """
+    # 1. Resolve split names against the actual group roster.
     members_for_resolution = (
         await list_group_members(telegram_group_id)
         if telegram_group_id is not None
@@ -364,9 +568,8 @@ async def _process_expense_capture(update: Update) -> None:
         payer_splitwise_user_id=payer_splitwise_user_id,
     )
 
-    # 6. Persist a pending row. The parsed JSON is the source of truth
-    # for the confirm step. We serialise via Pydantic's JSON mode so
-    # ``Decimal`` becomes a number (Supabase JSONB accepts that).
+    # 2. Persist a pending row. Pydantic JSON mode so Decimal serialises
+    # as a number (Supabase JSONB accepts that).
     parsed_data = parsed.model_dump(mode="json")
     parsed_data["_resolved"] = [
         {
@@ -391,7 +594,7 @@ async def _process_expense_capture(update: Update) -> None:
         await _safe_send(chat_id, "I couldn't save the draft. Try again?")
         return
 
-    # 7. Post confirmation message.
+    # 3. Post confirmation message.
     text = _format_confirmation_text(parsed, resolved)
     try:
         await _tg_bot.send_message(

@@ -159,7 +159,7 @@ async def test_parse_omits_transcript_when_none(
     user_text = next(
         c for c in client.aio.models.calls[0].contents if isinstance(c, str)
     )
-    assert "no voice note" in user_text.lower() or "no text" in user_text.lower()
+    assert "no instruction" in user_text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -218,11 +218,35 @@ async def test_parse_rejects_when_splits_do_not_sum_to_one(
 
 
 @pytest.mark.asyncio
-async def test_parse_rejects_empty_image(group_context: GroupContext) -> None:
-    client = _FakeGenaiClient.with_responses("{}")
+async def test_parse_accepts_text_only_input(
+    canned_expense_json: str, group_context: GroupContext
+) -> None:
+    """Empty image_bytes is now valid: the parser runs in text-only mode."""
+    client = _FakeGenaiClient.with_responses(canned_expense_json)
     parser = GeminiExpenseParser(client=client)  # type: ignore[arg-type]
-    with pytest.raises(ParserError):
-        await parser.parse(b"", None, group_context)
+
+    result = await parser.parse(b"", "I paid $20 at Trader Joe's", group_context)
+    assert isinstance(result, ParsedExpense)
+
+    # The contents list sent to Gemini should NOT include an image Part —
+    # only the user-text string when no image is provided.
+    contents = client.aio.models.calls[0].contents
+    assert all(isinstance(c, str) for c in contents)
+
+
+@pytest.mark.asyncio
+async def test_parse_text_only_prompt_flags_no_image(
+    canned_expense_json: str, group_context: GroupContext
+) -> None:
+    """The user prompt in text-only mode must tell the model no image is provided."""
+    client = _FakeGenaiClient.with_responses(canned_expense_json)
+    parser = GeminiExpenseParser(client=client)  # type: ignore[arg-type]
+
+    await parser.parse(b"", "split $20 with Priya", group_context)
+    user_text = next(
+        c for c in client.aio.models.calls[0].contents if isinstance(c, str)
+    )
+    assert "not provided" in user_text.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -10,21 +10,26 @@ from __future__ import annotations
 from app.ai.provider import GroupContext
 
 SYSTEM_PROMPT = """\
-You are a receipt-parsing assistant for a group expense-splitting bot.
+You are an expense-parsing assistant for a group expense-splitting bot.
 
-You will receive:
-  1. A photo of a receipt.
-  2. (Optional) a user instruction (transcript of a voice note, or text).
+You will receive some subset of:
+  1. A photo of a receipt (optional).
+  2. A user instruction in text (from a typed message, photo caption, or
+     voice-note transcript) (optional).
   3. The list of group members the expense can be split with.
 
 Your job is to return a single JSON object that conforms to the provided
 schema. Do not return prose. Do not wrap the JSON in markdown.
 
 Rules:
-  - "amount" is the receipt total (taxes and tips included).
-  - "currency" is the ISO 4217 code (e.g. "USD", "EUR", "INR"). If the
-    receipt is ambiguous, fall back to the default currency provided.
-  - "merchant" is the business name from the receipt, or null if unclear.
+  - "amount" is the expense total. From a receipt: include taxes and tips.
+    From a typed/spoken instruction: take the number the user states.
+    Must be > 0; if you cannot determine the amount confidently, set
+    "confidence" below 0.3 so the orchestrator can ask for clarification.
+  - "currency" is the ISO 4217 code (e.g. "USD", "EUR", "INR"). If
+    ambiguous, fall back to the default currency provided.
+  - "merchant" is the business name (from the receipt or the user's text),
+    or null if unclear.
   - "split_type" is the user's stated intent:
       * "equal"      — everyone pays the same fraction (the default if
                        the user does not specify how to split).
@@ -35,7 +40,7 @@ Rules:
                        to normalised fractions: 2:1 → 0.667 / 0.333.
       * "exact"      — user gave specific dollar amounts (e.g. "I had
                        $30, you had $17"). Convert each amount into a
-                       fraction of the receipt total.
+                       fraction of the expense total.
   - "splits" is a list of {"name", "share"} pairs.
       * "name" must match either "self" (the payer) or one of the
         provided member names exactly. Do not invent names that are not
@@ -43,8 +48,8 @@ Rules:
       * "share" is a fraction in [0, 1]. All shares MUST sum to 1.0
         (within 0.01). Round to 4 decimal places.
   - "confidence" is your own 0-to-1 estimate of how sure you are about
-    the amount + split. Penalise blurry receipts and ambiguous voice
-    notes.
+    the amount + split. Penalise blurry receipts, ambiguous instructions,
+    and especially missing information (no amount stated, no receipt).
 
 If the user instruction does not name anyone, split equally across the
 payer and every other provided member.
@@ -52,21 +57,37 @@ payer and every other provided member.
 If the user instruction names people who are not in the member list,
 include them anyway (the orchestrator will surface the mismatch) but
 lower your confidence.
+
+If you have NO receipt image AND the user instruction does not give you
+an amount, return "confidence" below 0.3 — the orchestrator will ask the
+user to clarify rather than fabricating an expense.
 """
 
 
-def build_user_prompt(transcript: str | None, context: GroupContext) -> str:
+def build_user_prompt(
+    transcript: str | None,
+    context: GroupContext,
+    *,
+    has_image: bool = True,
+) -> str:
     """Build the per-request text portion of the Gemini prompt.
 
-    Includes payer name, member names, default currency, and the
-    transcript / user instruction if one was supplied.
+    Includes payer name, member names, default currency, the user
+    instruction (if any), and a flag telling the model whether an image
+    is part of the request.
     """
     others = ", ".join(context.member_names) if context.member_names else "(none)"
-    instruction = (transcript or "").strip() or "(no voice note or text supplied)"
+    instruction = (transcript or "").strip() or "(no instruction supplied)"
+    image_note = (
+        "Receipt image: provided in this request."
+        if has_image
+        else "Receipt image: NOT provided — derive the amount and merchant from the user instruction alone."
+    )
     return (
         f'Payer: {context.payer_name} (use the name "self" for them in splits).\n'
         f"Group members available to split with: {others}.\n"
         f"Default currency if unclear: {context.default_currency}.\n"
+        f"{image_note}\n"
         f"User instruction: {instruction}\n"
     )
 

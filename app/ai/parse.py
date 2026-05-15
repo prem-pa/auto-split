@@ -137,16 +137,27 @@ class GeminiExpenseParser(ExpenseParser):
         transcript: str | None,
         context: GroupContext,
     ) -> ParsedExpense:
-        if not image_bytes:
-            raise ParserError("image_bytes is empty")
+        """Parse an expense from any combination of image and text.
 
-        user_text = build_user_prompt(transcript, context)
-        image_part = genai_types.Part.from_bytes(
-            data=image_bytes, mime_type=_detect_image_mime(image_bytes)
-        )
+        Either or both of ``image_bytes`` and ``transcript`` may carry the
+        useful information. If both are missing the result will be
+        low-confidence (the model is instructed to set confidence < 0.3
+        in that case so the orchestrator can ask for clarification).
+        """
+        has_image = bool(image_bytes)
+        user_text = build_user_prompt(transcript, context, has_image=has_image)
+
+        contents: list[object] = []
+        if has_image:
+            contents.append(
+                genai_types.Part.from_bytes(
+                    data=image_bytes, mime_type=_detect_image_mime(image_bytes)
+                )
+            )
+        contents.append(user_text)
 
         # First attempt — structured-output mode.
-        raw = await self._generate(user_text, image_part, strict_retry=False)
+        raw = await self._generate(contents, strict_retry=False)
         parsed = _try_validate(raw)
         if parsed is not None:
             return parsed
@@ -155,7 +166,7 @@ class GeminiExpenseParser(ExpenseParser):
         _LOG.warning(
             "gemini.parse.retry strict=true reason=invalid_json model=%s", self._model
         )
-        raw = await self._generate(user_text, image_part, strict_retry=True)
+        raw = await self._generate(contents, strict_retry=True)
         parsed = _try_validate(raw)
         if parsed is not None:
             return parsed
@@ -164,8 +175,7 @@ class GeminiExpenseParser(ExpenseParser):
 
     async def _generate(
         self,
-        user_text: str,
-        image_part: genai_types.Part,
+        contents: list[object],
         *,
         strict_retry: bool,
     ) -> str:
@@ -183,7 +193,7 @@ class GeminiExpenseParser(ExpenseParser):
         )
         response = await self._client.aio.models.generate_content(
             model=self._model,
-            contents=[image_part, user_text],
+            contents=contents,
             config=config,
         )
         text = _extract_text(response)
