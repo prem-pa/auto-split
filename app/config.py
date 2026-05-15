@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # Supabase
     supabase_url: str = ""
     supabase_service_role_key: SecretStr = SecretStr("")
+    # Direct Postgres connection string, used only by ``scripts/migrate.py``
+    # to apply DDL. Copy from Supabase dashboard → Project Settings →
+    # Database → Connection string (URI). Leave empty in normal runtime.
+    supabase_db_url: SecretStr = SecretStr("")
 
     # Fernet key for encrypting Splitwise tokens at rest
     token_encryption_key: SecretStr = SecretStr("")
