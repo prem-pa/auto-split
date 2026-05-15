@@ -117,16 +117,18 @@ class GeminiExpenseParser(ExpenseParser):
     Args:
         client: A pre-built ``google.genai.Client``. If ``None`` we build
             one from ``settings.gemini_api_key``. Tests pass a fake.
-        model: Override the Gemini model id (defaults to
-            ``gemini-2.0-flash``).
+        model: Override the Gemini model id. Defaults to
+            ``settings.gemini_model`` so users can swap models via the
+            ``GEMINI_MODEL`` env var without code changes — useful when
+            Google moves models in or out of the free tier.
     """
 
     def __init__(
         self,
         client: genai.Client | None = None,
-        model: str = GEMINI_MODEL,
+        model: str | None = None,
     ) -> None:
-        self._model = model
+        self._model = model or settings.gemini_model
         self._client = client or _build_default_client()
 
     async def parse(

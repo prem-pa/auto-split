@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     # AI providers
     groq_api_key: SecretStr = SecretStr("")
     gemini_api_key: SecretStr = SecretStr("")
+    # Gemini model id. Override via .env if the default isn't in the free tier
+    # on your Cloud project (Google rotates models in/out of free tier over time).
+    # Example values: "gemini-2.0-flash", "gemini-2.5-flash", "gemini-flash-lite".
+    gemini_model: str = "gemini-2.0-flash"
 
     # Supabase
     supabase_url: str = ""
