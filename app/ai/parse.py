@@ -12,6 +12,7 @@ metadata and (on failure) short, redacted excerpts.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Any
 
 from google import genai
@@ -22,6 +23,62 @@ from app.ai.prompts import SYSTEM_PROMPT, STRICT_RETRY_SUFFIX, build_user_prompt
 from app.ai.provider import ExpenseParser, GroupContext, ParserError
 from app.ai.schema import ParsedExpense
 from app.config import settings
+
+# JSON Schema keys that Gemini's ``Schema`` model rejects. We strip these
+# from ``ParsedExpense.model_json_schema()`` before handing it to Gemini.
+# Our Pydantic model still enforces them on the *response* — only the
+# transport-level schema we send to Gemini drops them.
+_GEMINI_DISALLOWED_KEYS = frozenset({"exclusiveMinimum", "exclusiveMaximum", "$schema"})
+
+
+def _inline_refs(schema: Any, defs: dict[str, Any]) -> Any:
+    """Recursively replace ``{"$ref": "#/$defs/Name"}`` with the named schema.
+
+    Gemini's schema validator doesn't follow ``$ref``; we resolve them
+    locally so nested models (e.g. ``Split`` inside ``ParsedExpense``)
+    end up inlined.
+    """
+    if isinstance(schema, dict):
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.removeprefix("#/$defs/")
+            return _inline_refs(deepcopy(defs.get(name, {})), defs)
+        return {k: _inline_refs(v, defs) for k, v in schema.items()}
+    if isinstance(schema, list):
+        return [_inline_refs(item, defs) for item in schema]
+    return schema
+
+
+def _strip_disallowed(schema: Any) -> Any:
+    """Recursively drop any key in :data:`_GEMINI_DISALLOWED_KEYS`."""
+    if isinstance(schema, dict):
+        return {
+            k: _strip_disallowed(v)
+            for k, v in schema.items()
+            if k not in _GEMINI_DISALLOWED_KEYS
+        }
+    if isinstance(schema, list):
+        return [_strip_disallowed(item) for item in schema]
+    return schema
+
+
+def _gemini_compatible_schema(json_schema: dict[str, Any]) -> dict[str, Any]:
+    """Transform a Pydantic JSON Schema into something Gemini accepts.
+
+    Two changes:
+        * Inline every ``$ref`` against the top-level ``$defs`` block.
+        * Strip JSON Schema keys Gemini's transport-side ``Schema``
+          validator rejects (``exclusiveMinimum``, ``exclusiveMaximum``,
+          ``$schema``).
+
+    Returns a new dict; the input is not mutated.
+    """
+    defs = json_schema.get("$defs", {})
+    inlined = _inline_refs(deepcopy(json_schema), defs)
+    if isinstance(inlined, dict):
+        inlined.pop("$defs", None)
+    return _strip_disallowed(inlined)
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -117,7 +174,9 @@ class GeminiExpenseParser(ExpenseParser):
         config = genai_types.GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
-            response_schema=ParsedExpense.model_json_schema(),
+            response_schema=_gemini_compatible_schema(
+                ParsedExpense.model_json_schema()
+            ),
             temperature=0.2,
         )
         response = await self._client.aio.models.generate_content(

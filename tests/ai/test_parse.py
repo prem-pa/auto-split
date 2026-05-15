@@ -13,7 +13,11 @@ from typing import Any
 import pytest
 
 from app.ai.factory import default_parser
-from app.ai.parse import GeminiExpenseParser, _detect_image_mime
+from app.ai.parse import (
+    GeminiExpenseParser,
+    _detect_image_mime,
+    _gemini_compatible_schema,
+)
 from app.ai.provider import GroupContext, ParserError
 from app.ai.schema import ParsedExpense
 from tests.ai.conftest import FAKE_JPEG_BYTES, FAKE_PNG_BYTES
@@ -111,7 +115,11 @@ async def test_parse_sends_structured_output_schema(
     call = client.aio.models.calls[0]
     config = call.config
     assert config.response_mime_type == "application/json"
-    assert config.response_schema == ParsedExpense.model_json_schema()
+    # The schema we send to Gemini is the transformed version — Gemini
+    # rejects ``exclusiveMinimum`` / ``$ref``, so we strip and inline.
+    assert config.response_schema == _gemini_compatible_schema(
+        ParsedExpense.model_json_schema()
+    )
     # System prompt is set on the config, not in contents.
     assert config.system_instruction is not None
     assert "JSON" in config.system_instruction
@@ -215,6 +223,58 @@ async def test_parse_rejects_empty_image(group_context: GroupContext) -> None:
     parser = GeminiExpenseParser(client=client)  # type: ignore[arg-type]
     with pytest.raises(ParserError):
         await parser.parse(b"", None, group_context)
+
+
+# ---------------------------------------------------------------------------
+# Gemini-compatible schema transform
+# ---------------------------------------------------------------------------
+
+
+def _find_keys(obj: Any, keys: set[str]) -> list[str]:
+    """Recursively collect any path where ``obj`` has a key in ``keys``."""
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys:
+                found.append(k)
+            found.extend(_find_keys(v, keys))
+    elif isinstance(obj, list):
+        for v in obj:
+            found.extend(_find_keys(v, keys))
+    return found
+
+
+def test_gemini_schema_strips_exclusive_min_and_max() -> None:
+    raw = ParsedExpense.model_json_schema()
+    # Sanity: the raw pydantic schema HAS exclusiveMinimum somewhere
+    # (from Field(gt=0) on amount).
+    assert "exclusiveMinimum" in _find_keys(raw, {"exclusiveMinimum"})
+
+    cleaned = _gemini_compatible_schema(raw)
+    assert _find_keys(cleaned, {"exclusiveMinimum", "exclusiveMaximum"}) == []
+
+
+def test_gemini_schema_inlines_defs_and_refs() -> None:
+    raw = ParsedExpense.model_json_schema()
+    # Sanity: raw schema uses $ref + $defs for the Split sub-model.
+    assert "$defs" in raw
+    assert "$ref" in _find_keys(raw, {"$ref"})
+
+    cleaned = _gemini_compatible_schema(raw)
+    assert "$defs" not in cleaned
+    assert _find_keys(cleaned, {"$ref"}) == []
+    # Split's properties should now appear inline under splits.items
+    splits_items = cleaned["properties"]["splits"]["items"]
+    assert splits_items.get("type") == "object"
+    assert "share" in splits_items["properties"]
+    assert "name" in splits_items["properties"]
+
+
+def test_gemini_schema_does_not_mutate_input() -> None:
+    raw = ParsedExpense.model_json_schema()
+    snapshot = json.dumps(raw, sort_keys=True)
+    _gemini_compatible_schema(raw)
+    assert json.dumps(raw, sort_keys=True) == snapshot
 
 
 # ---------------------------------------------------------------------------
