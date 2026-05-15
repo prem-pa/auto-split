@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.logging_setup import configure_logging
+from app.telegram import telegram_router
 
 
 def create_app() -> FastAPI:
@@ -16,6 +17,8 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    app.include_router(telegram_router)
 
     return app
 
