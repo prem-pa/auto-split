@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import urllib.parse
 from pathlib import Path
 
 # Make the project root importable when invoked via ``uv run python``.
@@ -51,12 +52,37 @@ def _discover_migrations() -> list[Path]:
     return sorted(p for p in MIGRATIONS_DIR.glob("*.sql") if p.is_file())
 
 
+def _project_ref(supabase_url: str) -> str | None:
+    """Extract the project ref from a Supabase REST URL.
+
+    https://<ref>.supabase.co → <ref>
+    """
+    host = urllib.parse.urlparse(supabase_url).hostname or ""
+    if host.endswith(".supabase.co"):
+        return host.split(".", 1)[0]
+    return None
+
+
+def _build_db_url() -> str | None:
+    """Construct the direct Postgres URL from ``supabase_url`` + password.
+
+    Returns None if either component is missing. The Supabase direct
+    connection always uses user=postgres, db=postgres, port=5432.
+    """
+    ref = _project_ref(settings.supabase_url)
+    password = settings.postgres_password.get_secret_value()
+    if not ref or not password:
+        return None
+    encoded = urllib.parse.quote(password, safe="")
+    return f"postgresql://postgres:{encoded}@db.{ref}.supabase.co:5432/postgres"
+
+
 def _connect() -> psycopg.Connection:
-    db_url = settings.supabase_db_url.get_secret_value()
+    db_url = settings.supabase_db_url.get_secret_value() or _build_db_url()
     if not db_url:
         sys.stderr.write(
-            "missing SUPABASE_DB_URL — copy the URI from the Supabase "
-            "dashboard → Project Settings → Database → Connection string.\n"
+            "cannot determine Postgres URL — set SUPABASE_DB_URL, or set "
+            "SUPABASE_URL together with POSTGRES_PASSWORD (POSTGRES_PASS).\n"
         )
         raise SystemExit(2)
     # autocommit=False; we manage transactions explicitly per file.

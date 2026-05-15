@@ -1,4 +1,4 @@
-from pydantic import SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,8 +38,19 @@ class Settings(BaseSettings):
     supabase_service_role_key: SecretStr = SecretStr("")
     # Direct Postgres connection string, used only by ``scripts/migrate.py``
     # to apply DDL. Copy from Supabase dashboard → Project Settings →
-    # Database → Connection string (URI). Leave empty in normal runtime.
+    # Database → Connection string (URI). If empty, migrate.py will try to
+    # build it from ``supabase_url`` + ``postgres_password`` below.
     supabase_db_url: SecretStr = SecretStr("")
+    # Postgres password used to construct the DB URL when supabase_db_url is
+    # empty. Accepts the env var ``POSTGRES_PASS`` or ``POSTGRES_PASSWORD``.
+    postgres_password: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias=AliasChoices(
+            "postgres_password",
+            "POSTGRES_PASSWORD",
+            "POSTGRES_PASS",
+        ),
+    )
 
     # Fernet key for encrypting Splitwise tokens at rest
     token_encryption_key: SecretStr = SecretStr("")
