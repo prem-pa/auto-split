@@ -131,11 +131,96 @@ async def test_start_command_in_dm_replies_with_oauth_url(
 async def test_unknown_dm_text_also_offers_oauth_link(
     mocks: PipelineMocks,
 ) -> None:
+    """An unconnected user pinging the bot gets the OAuth nudge, even if
+    the text happens to be a recognised greeting — connection comes first.
+    """
     await expense_pipeline.handle_incoming_message(_text_update("hi there", user_id=11))
 
     assert len(mocks.sent) == 1
     assert "splitwise" in mocks.sent[0].text.lower()
     assert "secure.splitwise.com/oauth/authorize" in mocks.sent[0].text
+
+
+# ---------------------------------------------------------------------------
+# Greeting handler (connected users)
+# ---------------------------------------------------------------------------
+
+
+def test_is_greeting_strips_punctuation_and_whitespace() -> None:
+    is_greeting = expense_pipeline._is_greeting
+    assert is_greeting("hi") is True
+    assert is_greeting("Hi!") is True
+    assert is_greeting("  hi.  ") is True
+    assert is_greeting("HELLO") is True
+    assert is_greeting("hey there") is True
+    assert is_greeting("Hey There.") is True
+    assert is_greeting("good morning") is True
+    assert is_greeting("yo") is True
+
+
+def test_is_greeting_rejects_anything_with_extra_words_or_empty() -> None:
+    is_greeting = expense_pipeline._is_greeting
+    # Extra content past the greeting → falls through to parser.
+    assert is_greeting("hi I paid $20 at TJ") is False
+    assert is_greeting("hello can you help") is False
+    # Words that aren't in the greeting set.
+    assert is_greeting("ok") is False
+    assert is_greeting("split this") is False
+    assert is_greeting("") is False
+    assert is_greeting("   ") is False
+
+
+@pytest.mark.asyncio
+async def test_greeting_from_connected_user_replies_friendly_and_skips_parser(
+    mocks: PipelineMocks,
+) -> None:
+    """Bare 'hi' from a connected user gets a short friendly reply with
+    their first_name and does NOT invoke the parser or create a pending.
+    """
+    mocks.tokens[42] = ("token", 555)
+
+    await expense_pipeline.handle_incoming_message(_text_update("hi", user_id=42))
+
+    assert len(mocks.sent) == 1
+    reply = mocks.sent[0].text
+    # Personalised — _text_update sets first_name="Tester".
+    assert "Tester" in reply
+    # NOT another OAuth link.
+    assert "secure.splitwise.com/oauth" not in reply
+    # Parser never ran, no pending was created.
+    assert mocks.parser_calls == []
+    assert mocks.created_pendings == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "greeting", ["hi", "Hi!", "HELLO there", "yo", "  hey  ", "good morning"]
+)
+async def test_greeting_variants_all_short_circuit(
+    mocks: PipelineMocks, greeting: str
+) -> None:
+    mocks.tokens[42] = ("token", 555)
+    await expense_pipeline.handle_incoming_message(_text_update(greeting, user_id=42))
+    assert len(mocks.sent) == 1, f"no reply for greeting {greeting!r}"
+    assert mocks.parser_calls == [], f"parser ran for greeting {greeting!r}"
+
+
+@pytest.mark.asyncio
+async def test_greeting_with_extra_content_falls_through_to_parser(
+    mocks: PipelineMocks,
+) -> None:
+    """'hi I paid $20...' is NOT a pure greeting — it should reach the
+    parser, not the canned greeting reply."""
+    mocks.tokens[42] = ("token", 555)
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update("hi I paid $20 at TJ split equally with Shreya", user_id=42)
+    )
+
+    # Parser ran exactly once. The canned greeting reply was NOT sent.
+    assert len(mocks.parser_calls) == 1
+    if mocks.sent:
+        assert "Hey Tester!" not in mocks.sent[0].text
 
 
 # ---------------------------------------------------------------------------

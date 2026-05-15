@@ -155,6 +155,13 @@ async def handle_incoming_message(update: Update) -> None:
         # disconnected state in front of everyone.
         return
 
+    # Pure greeting ("hi", "yo", "hello there") → friendly reply, skip the
+    # parser entirely. Must come before voice/text capture so "hi" doesn't
+    # get fed to Gemini and come back as a "not enough info" template.
+    if text and _is_greeting(text):
+        await _handle_greeting(chat_id, user.first_name)
+        return
+
     # Voice without a photo → transcribe → text-only capture.
     if message.voice is not None:
         await _process_voice_only_capture(
@@ -238,6 +245,69 @@ _NOT_ENOUGH_INFO_HINT = (
 # this we don't bother the user with a confirmation — we ask them to add
 # more detail instead.
 _TEXT_CAPTURE_CONFIDENCE_FLOOR = 0.3
+
+# Standalone greetings we recognise. Match against a normalised (lowercase,
+# alphanumerics only, single-spaced) version of the user's text, so "Hi!",
+# "Hi", "hi.", and "Hi " all reduce to "hi". Anything longer or with extra
+# words ("hi i paid $20") falls through to the parser — we only short-
+# circuit on *pure* greetings.
+_GREETINGS = frozenset(
+    {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "yoyo",
+        "yo yo",
+        "sup",
+        "wassup",
+        "whats up",
+        "whatup",
+        "hola",
+        "namaste",
+        "howdy",
+        "hiya",
+        "heya",
+        "morning",
+        "good morning",
+        "afternoon",
+        "good afternoon",
+        "evening",
+        "good evening",
+        "hi there",
+        "hey there",
+        "hello there",
+    }
+)
+
+
+def _is_greeting(text: str) -> bool:
+    """True when ``text`` is one of the pure-greeting phrases in :data:`_GREETINGS`.
+
+    Strips punctuation and collapses whitespace, so "Hi!", "  hi.  ", and
+    "Hi" all match. Anything that contains extra words beyond the greeting
+    (e.g. "hi I paid $20") will not match — those go to the parser.
+    """
+    cleaned = "".join(c for c in text.lower() if c.isalnum() or c.isspace())
+    normalised = " ".join(cleaned.split())
+    return bool(normalised) and normalised in _GREETINGS
+
+
+async def _handle_greeting(chat_id: int, first_name: str | None) -> None:
+    """Reply to a pure greeting (hi/yo/hello/etc.) with a short prompt.
+
+    Uses the user's first_name when we have it so the reply feels personal
+    rather than canned.
+    """
+    name = first_name.strip() if first_name else ""
+    salutation = f"Hey {name}! 👋" if name else "Hey! 👋"
+    await _safe_send(
+        chat_id,
+        f"{salutation}\n\n"
+        "Send me a receipt photo, or describe an expense in text — I'll "
+        "add it to Splitwise.\n\n"
+        'Example: "I paid $24 at Trader Joe\'s, split equally with Shreya"',
+    )
 
 
 async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
