@@ -80,9 +80,15 @@ def _set_db_url(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_missing_db_url_exits_with_code_2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """With no SUPABASE_DB_URL *and* no fallback (SUPABASE_URL + password),
+    the script must exit cleanly with code 2 instead of trying to connect."""
     from app.config import settings
 
+    # Clear all three sources migrate.py tries: the explicit URL, and the
+    # SUPABASE_URL + POSTGRES_PASSWORD pair that _build_db_url() falls back to.
     monkeypatch.setattr(settings, "supabase_db_url", SecretStr(""))
+    monkeypatch.setattr(settings, "supabase_url", "")
+    monkeypatch.setattr(settings, "postgres_password", SecretStr(""))
     mod = _load_migrate_module()
     with pytest.raises(SystemExit) as exc:
         mod.run()

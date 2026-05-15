@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.logging_setup import configure_logging
+from app.splitwise import splitwise_router
 from app.telegram import telegram_router
 
 
@@ -19,6 +20,7 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(telegram_router)
+    app.include_router(splitwise_router)
 
     return app
 
