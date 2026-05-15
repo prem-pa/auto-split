@@ -23,8 +23,13 @@ import json
 import sys
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
-from app.config import settings
+# Make the project root importable when invoked as ``uv run python scripts/set_webhook.py``.
+# (Python only adds the script's own directory to sys.path; ``app`` lives one level up.)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.config import settings  # noqa: E402 — must follow sys.path tweak
 
 WEBHOOK_PATH = "/telegram/webhook"
 ALLOWED_UPDATES = ["message", "callback_query"]
