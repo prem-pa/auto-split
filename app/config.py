@@ -1,5 +1,7 @@
-from pydantic import AliasChoices, Field, SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+
+from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -20,6 +22,23 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_webhook_secret: SecretStr = SecretStr("")
+    # Comma-separated Telegram user IDs allowed to use the bot.
+    # Empty list = no restriction (anyone who DMs the bot can use it).
+    # Non-empty list = strict allowlist; everyone else gets a polite
+    # rejection and their handler never runs.
+    # ``NoDecode`` tells pydantic-settings to skip its default JSON parsing
+    # for this complex type so we can accept a plain CSV from the env var.
+    telegram_allowed_user_ids: Annotated[list[int], NoDecode] = Field(
+        default_factory=list
+    )
+
+    @field_validator("telegram_allowed_user_ids", mode="before")
+    @classmethod
+    def _parse_allowed_user_ids(cls, value: object) -> object:
+        """Accept either a list[int] (in code) or a CSV string (from env)."""
+        if isinstance(value, str):
+            return [int(part.strip()) for part in value.split(",") if part.strip()]
+        return value
 
     # Public-facing base URL for the backend (Telegram webhook target +
     # Splitwise OAuth redirect)

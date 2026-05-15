@@ -23,7 +23,7 @@ from telegram import Update
 
 from app.config import settings
 from app.telegram import handlers
-from app.telegram.bot import get_bot
+from app.telegram.bot import get_bot, send_message
 
 log = logging.getLogger(__name__)
 
@@ -54,11 +54,59 @@ def _verify_secret(provided: str | None) -> None:
         )
 
 
+def _is_sender_allowed(update: Update) -> bool:
+    """Check the sender against ``settings.telegram_allowed_user_ids``.
+
+    Empty allowlist → no restriction (everyone allowed).
+    Non-empty allowlist → sender must be in the list. Unknown sender
+    (no ``effective_user``) is denied under a strict allowlist.
+    """
+    allowed = settings.telegram_allowed_user_ids
+    if not allowed:
+        return True
+    user = update.effective_user
+    if user is None:
+        return False
+    return user.id in set(allowed)
+
+
+async def _reject_unauthorized(update: Update) -> None:
+    """Reply once to a disallowed sender with their ID so they can request access.
+
+    Best-effort: failures are logged but never re-raised, since this runs
+    inside the webhook's exception-swallowing dispatch path anyway.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    user = update.effective_user
+    user_id_str = str(user.id) if user is not None else "unknown"
+    try:
+        await send_message(
+            chat_id=chat.id,
+            text=(
+                "This bot is invite-only. Ask the owner to allowlist your "
+                f"Telegram ID: {user_id_str}"
+            ),
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never bubble
+        log.exception("failed to send invite-only reply to chat=%s", chat.id)
+
+
 async def _dispatch(update: Update) -> None:
     """Route a parsed Update to the correct handler.
 
     Phase 1 is echo-only. Brick F swaps in the real pipeline.
     """
+    if not _is_sender_allowed(update):
+        user = update.effective_user
+        log.info(
+            "rejected unauthorized telegram_user_id=%s (allowlist enabled)",
+            user.id if user is not None else "unknown",
+        )
+        await _reject_unauthorized(update)
+        return
+
     if update.callback_query is not None:
         await handlers.handle_callback_query(update)
         return

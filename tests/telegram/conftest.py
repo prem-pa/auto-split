@@ -60,6 +60,7 @@ def sent_messages(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     # Patch all import sites: the bot module *and* the re-exports / handler use.
     monkeypatch.setattr("app.telegram.bot.send_message", fake_send_message)
     monkeypatch.setattr("app.telegram.handlers.send_message", fake_send_message)
+    monkeypatch.setattr("app.telegram.webhook.send_message", fake_send_message)
     return sent
 
 

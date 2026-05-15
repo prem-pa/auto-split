@@ -184,3 +184,80 @@ def test_handler_exception_does_not_5xx_telegram(
 
     resp = client.post("/telegram/webhook", json=_text_update("hi"), headers=_HEADERS)
     assert resp.status_code == 200
+
+
+# --- allowlist behaviour ---------------------------------------------------
+
+
+def test_empty_allowlist_admits_anyone(
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default config has an empty allowlist, so every user is allowed."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "telegram_allowed_user_ids", [])
+    resp = client.post(
+        "/telegram/webhook", json=_text_update("hi", chat_id=42), headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    # Handler ran → echo went out, no rejection message.
+    assert sent_messages == [{"chat_id": 42, "text": "got: hi", "reply_markup": None}]
+
+
+def test_allowlisted_user_is_admitted(
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "telegram_allowed_user_ids", [42])
+    resp = client.post(
+        "/telegram/webhook", json=_text_update("hello", chat_id=42), headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    assert sent_messages == [
+        {"chat_id": 42, "text": "got: hello", "reply_markup": None}
+    ]
+
+
+def test_disallowed_user_gets_invite_only_reply_and_no_handler_run(
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.config import settings
+
+    # 99 is allowed; 42 (our fixture sender) is not.
+    monkeypatch.setattr(settings, "telegram_allowed_user_ids", [99])
+    resp = client.post(
+        "/telegram/webhook", json=_text_update("snoop", chat_id=42), headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    # Exactly one message: the rejection (no "got: snoop" echo).
+    assert len(sent_messages) == 1
+    rejection = sent_messages[0]
+    assert rejection["chat_id"] == 42
+    assert "invite-only" in rejection["text"].lower()
+    # The rejection includes the user's ID so they can request access.
+    assert "42" in rejection["text"]
+
+
+def test_allowlist_applies_to_callback_queries_too(
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    _mock_answer_callback_query: None,
+) -> None:
+    """A non-allowlisted user tapping an inline keyboard gets rejected."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "telegram_allowed_user_ids", [99])
+    resp = client.post(
+        "/telegram/webhook", json=_callback_update("cf:deadbeef"), headers=_HEADERS
+    )
+    assert resp.status_code == 200
+    assert len(sent_messages) == 1
+    assert "invite-only" in sent_messages[0]["text"].lower()
