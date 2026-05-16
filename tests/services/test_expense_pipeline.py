@@ -337,8 +337,9 @@ async def test_named_payer_reroutes_pending_to_that_user(
     assert "Paid by: Hardik" in reply
     # "self" placeholder is replaced by the payer's name (Hardik).
     assert "Hardik: 50%" in reply
-    # And only Hardik can confirm.
-    assert "Only Hardik can Confirm" in reply
+    # Footer reminds that Hardik is the one who taps Confirm.
+    assert "Hardik" in reply.split("\n")[-1]
+    assert "Confirm" in reply.split("\n")[-1]
 
 
 @pytest.mark.asyncio
@@ -375,6 +376,135 @@ async def test_named_payer_who_is_unconnected_gets_friendly_error(
     assert mocks.created_pendings == []
     # User-visible error mentions Hardik + /start.
     assert any("Hardik" in m.text and "/start" in m.text for m in mocks.sent)
+
+
+@pytest.mark.asyncio
+async def test_sender_can_cancel_even_when_payer_is_someone_else(
+    mocks: PipelineMocks,
+) -> None:
+    """Hardik types 'Shreya paid X' — pending row is keyed to Shreya
+    (only she can Confirm), but Hardik should still be able to Cancel
+    the message he himself sent. Likewise Edit."""
+    # Both connected.
+    mocks.tokens[42] = ("hardik-token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Hardik", splitwise_user_id=555
+    )
+    mocks.users[100] = User(
+        telegram_user_id=100, first_name="Shreya", splitwise_user_id=900
+    )
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("30.00"),
+        currency="USD",
+        merchant="Coffee place",
+        split_type="equal",
+        payer="Shreya",
+        splits=[Split(name="self", share=0.5), Split(name="Hardik", share=0.5)],
+        confidence=0.9,
+    )
+
+    # Hardik (uid 42) records the expense.
+    await expense_pipeline.handle_incoming_message(
+        _text_update("Shreya paid $30 split with me", user_id=42)
+    )
+
+    # Pending is keyed to Shreya (uid 100), not Hardik.
+    assert len(mocks.created_pendings) == 1
+    assert mocks.created_pendings[0].payer_telegram_user_id == 100
+    # But Hardik's id was stashed in parsed_data so he can still act on it.
+    assert mocks.created_pendings[0].parsed_data["_sender_telegram_user_id"] == 42
+
+    # Find the pending UUID we just created.
+    pid = next(iter(mocks.pendings.keys()))
+    mocks.sent.clear()
+    mocks.edits.clear()
+
+    # Hardik (the sender, NOT the payer) taps Cancel → should work.
+    cb = _callback_update(f"{keyboards.CANCEL_PREFIX}:{pid.hex}", user_id=42)
+    await expense_pipeline.handle_callback(cb.callback_query)  # type: ignore[arg-type]
+
+    assert pid in mocks.deleted_pendings
+    assert any("Cancelled" in e.text for e in mocks.edits)
+
+
+@pytest.mark.asyncio
+async def test_sender_can_edit_even_when_payer_is_someone_else(
+    mocks: PipelineMocks,
+) -> None:
+    """Same setup — Hardik types 'Shreya paid X' — Hardik should be able
+    to tap Edit and get the 'send the receipt again' prompt."""
+    mocks.tokens[42] = ("hardik-token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Hardik", splitwise_user_id=555
+    )
+    mocks.users[100] = User(
+        telegram_user_id=100, first_name="Shreya", splitwise_user_id=900
+    )
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("30.00"),
+        currency="USD",
+        merchant="Coffee",
+        split_type="equal",
+        payer="Shreya",
+        splits=[Split(name="self", share=1.0)],
+        confidence=0.9,
+    )
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update("Shreya paid $30", user_id=42)
+    )
+    pid = next(iter(mocks.pendings.keys()))
+    mocks.sent.clear()
+
+    cb = _callback_update(f"{keyboards.EDIT_PREFIX}:{pid.hex}", user_id=42)
+    await expense_pipeline.handle_callback(cb.callback_query)  # type: ignore[arg-type]
+
+    assert any("Send the receipt again" in m.text for m in mocks.sent)
+    # Pending stays — user might still tap Confirm/Cancel.
+    assert pid in mocks.pendings
+
+
+@pytest.mark.asyncio
+async def test_sender_still_cannot_confirm_when_payer_is_someone_else(
+    mocks: PipelineMocks,
+) -> None:
+    """Security check: even though the sender can Cancel/Edit, only the
+    payer can actually authorise the Splitwise expense."""
+    mocks.tokens[42] = ("hardik-token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Hardik", splitwise_user_id=555
+    )
+    mocks.users[100] = User(
+        telegram_user_id=100, first_name="Shreya", splitwise_user_id=900
+    )
+    mocks.tokens[100] = ("shreya-token", 900)
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("30.00"),
+        currency="USD",
+        merchant="Coffee",
+        split_type="equal",
+        payer="Shreya",
+        splits=[Split(name="self", share=0.5), Split(name="Hardik", share=0.5)],
+        confidence=0.9,
+    )
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update("Shreya paid $30 split with me", user_id=42)
+    )
+    pid = next(iter(mocks.pendings.keys()))
+    mocks.sent.clear()
+    mocks.edits.clear()
+
+    # Hardik (sender, NOT payer) taps Confirm → should be rejected.
+    cb = _callback_update(f"{keyboards.CONFIRM_PREFIX}:{pid.hex}", user_id=42)
+    await expense_pipeline.handle_callback(cb.callback_query)  # type: ignore[arg-type]
+
+    # No Splitwise call was made.
+    assert mocks.sw_create_calls == []
+    # No completion recorded.
+    assert mocks.marked_completed == []
+    # Pending row still alive (only confirm or cancel removes it).
+    assert pid in mocks.pendings
 
 
 @pytest.mark.asyncio

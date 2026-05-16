@@ -758,7 +758,11 @@ async def _finalize_capture(
         payer_splitwise_user_id=payer_splitwise_user_id,
     )
 
-    # 3. Persist a pending row keyed to the PAYER (not the sender).
+    # 3. Persist a pending row keyed to the PAYER (only they can Confirm
+    # since the expense will hit their Splitwise account). We also stash
+    # the sender in parsed_data so they can Cancel/Edit — the "event
+    # owner" intuition: if Hardik types "Shreya paid X", Hardik should
+    # still be able to retract the message he just sent.
     parsed_data = parsed.model_dump(mode="json")
     parsed_data["_resolved"] = [
         {
@@ -770,6 +774,7 @@ async def _finalize_capture(
         }
         for r in resolved
     ]
+    parsed_data["_sender_telegram_user_id"] = sender_telegram_user_id
 
     try:
         pending = await create_pending(
@@ -831,6 +836,34 @@ def _format_expense_details(parsed: ParsedExpense) -> str | None:
     return "\n".join(lines)
 
 
+def _sender_id_from_pending(pending: Any) -> int | None:
+    """Read the sender's telegram_user_id stashed in ``parsed_data``.
+
+    Returns ``None`` if the row predates the sender-stash convention
+    (e.g. a long-pending row from before the feature shipped) or the
+    payload is malformed.
+    """
+    data = pending.parsed_data or {}
+    sender = data.get("_sender_telegram_user_id")
+    if isinstance(sender, int):
+        return sender
+    return None
+
+
+def _is_pending_owner(pending: Any, telegram_user_id: int) -> bool:
+    """True if ``telegram_user_id`` can Cancel or Edit ``pending``.
+
+    Either the payer (whose Splitwise account is on the line) or the
+    sender (whose message kicked the whole thing off) can retract or
+    revise. Confirm stays strict — only the payer can authorise the
+    actual expense (see :func:`handle_confirm`).
+    """
+    if pending.payer_telegram_user_id == telegram_user_id:
+        return True
+    sender = _sender_id_from_pending(pending)
+    return sender is not None and sender == telegram_user_id
+
+
 def _format_confirmation_text(
     parsed: ParsedExpense,
     resolved: list[ResolvedSplit],
@@ -863,7 +896,10 @@ def _format_confirmation_text(
         else:
             label = display_name
         lines.append(f"  • {label}: {pct}")
-    lines.append(f"\nOnly {payer_display} can Confirm to add to Splitwise.")
+    lines.append(
+        f"\n{payer_display}, tap Confirm to add to Splitwise. "
+        "Anyone here can Cancel or Edit."
+    )
     return "\n".join(lines)
 
 
@@ -1015,20 +1051,23 @@ async def handle_cancel(
     chat_id: int | None,
     message_id: int | None,
 ) -> None:
-    """Cancel tap: delete the pending row and edit the message."""
+    """Cancel tap: delete the pending row and edit the message.
+
+    Either the payer or the original sender can Cancel — the sender
+    "owns" the message they sent and should be able to retract it even
+    when the parsed payer is someone else.
+    """
     pending = await get_pending(pending_id)
     if pending is None:
         await _edit_or_send(
             chat_id, message_id, "This expense was already handled or has expired."
         )
         return
-    if (
-        pending.payer_telegram_user_id is not None
-        and pending.payer_telegram_user_id != telegram_user_id
-    ):
+    if not _is_pending_owner(pending, telegram_user_id):
         if chat_id is not None:
             await _safe_send(
-                chat_id, "Only the person who sent the receipt can cancel it."
+                chat_id,
+                "Only the payer or whoever sent this message can cancel it.",
             )
         return
 
@@ -1063,12 +1102,12 @@ async def handle_edit(
             chat_id, message_id, "This expense was already handled or has expired."
         )
         return
-    if (
-        pending.payer_telegram_user_id is not None
-        and pending.payer_telegram_user_id != telegram_user_id
-    ):
+    if not _is_pending_owner(pending, telegram_user_id):
         if chat_id is not None:
-            await _safe_send(chat_id, "Only the payer can edit this.")
+            await _safe_send(
+                chat_id,
+                "Only the payer or whoever sent this message can edit it.",
+            )
         return
 
     if chat_id is not None:
