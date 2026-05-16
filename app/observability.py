@@ -16,6 +16,11 @@ Helper functions:
     * :func:`update_span` — set ``input`` / ``output`` / ``metadata`` on
       the currently-active span (useful when you want to override what
       the decorator auto-captured, e.g. to exclude raw image bytes).
+    * :func:`trace_context` — context manager that stamps trace-level
+      attributes (``tags``, ``user_id``, ``session_id``, ``metadata``)
+      onto the current span AND propagates them to every child span
+      created inside the ``with`` block. Used at the top of root
+      handlers to tag traces by environment / user / chat session.
     * :func:`is_enabled` — boolean: was Langfuse successfully initialized.
 """
 
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from typing import Any
 
 from app.config import settings
@@ -43,6 +49,7 @@ _LANGFUSE_ENABLED = _enabled()
 # means a missing dep won't crash the bot in disabled mode.
 _langfuse_client: Any | None = None
 _langfuse_observe: Any | None = None
+_langfuse_propagate: Any | None = None
 
 if _LANGFUSE_ENABLED:
     try:
@@ -57,7 +64,11 @@ if _LANGFUSE_ENABLED:
         if settings.langfuse_host:
             os.environ.setdefault("LANGFUSE_HOST", settings.langfuse_host)
 
-        from langfuse import get_client, observe as _langfuse_observe  # noqa: E402
+        from langfuse import (  # noqa: E402
+            get_client,
+            observe as _langfuse_observe,
+            propagate_attributes as _langfuse_propagate,
+        )
 
         _langfuse_client = get_client()
         log.info("langfuse observability enabled host=%s", settings.langfuse_host)
@@ -66,6 +77,7 @@ if _LANGFUSE_ENABLED:
         _LANGFUSE_ENABLED = False
         _langfuse_client = None
         _langfuse_observe = None
+        _langfuse_propagate = None
 else:
     log.info("langfuse observability disabled (keys not set)")
 
@@ -129,4 +141,59 @@ def update_span(
         log.exception("langfuse update_span failed")
 
 
-__all__ = ["is_enabled", "observe", "update_span"]
+def trace_context(
+    *,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, str] | None = None,
+) -> Any:
+    """Context manager that propagates trace attributes to all child spans.
+
+    Use at the top of root-span handlers to apply environment tags,
+    user identification, session grouping, etc. Attributes set here
+    show up on the trace AND on every child span created inside the
+    ``with`` block.
+
+    Automatically adds the configured ``settings.environment`` value to
+    ``tags`` (so e.g. dev runs are filterable from prod runs in the
+    Langfuse dashboard).
+
+    No-op when Langfuse is disabled — the ``with`` block just runs normally.
+
+    Example:
+        async def handle_incoming_message(update):
+            ...
+            with trace_context(
+                user_id=str(telegram_user_id),
+                session_id=f"chat-{chat_id}",
+                tags=["photo"] if has_photo else None,
+            ):
+                # all child spans (transcribe, parse, ...) get tagged.
+                ...
+    """
+    if not _LANGFUSE_ENABLED or _langfuse_propagate is None:
+        return nullcontext()
+
+    # Auto-tag every trace with the environment label.
+    env_tag = settings.environment.strip()
+    merged_tags: list[str] | None
+    if env_tag:
+        merged_tags = [env_tag, *(tags or [])]
+    else:
+        merged_tags = tags
+
+    # Langfuse rejects non-string metadata values; coerce defensively.
+    stringified_metadata: dict[str, str] | None = (
+        {k: str(v) for k, v in metadata.items()} if metadata else None
+    )
+
+    return _langfuse_propagate(
+        user_id=user_id,
+        session_id=session_id,
+        tags=merged_tags,
+        metadata=stringified_metadata,
+    )
+
+
+__all__ = ["is_enabled", "observe", "trace_context", "update_span"]
