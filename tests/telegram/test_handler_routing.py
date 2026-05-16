@@ -306,3 +306,41 @@ def test_allowlist_applies_to_callback_queries_too(
     assert resp.status_code == 200
     assert len(sent_messages) == 1
     assert "invite-only" in sent_messages[0]["text"].lower()
+
+
+# --- anonymous-sender reject path -----------------------------------------
+
+
+def test_group_anonymous_admin_gets_friendly_explanation_not_invite_only(
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+) -> None:
+    """Messages from @GroupAnonymousBot (id 1087968824) should be rejected
+    with a specific explanation, not the generic invite-only message —
+    the user can't change their ID and 'allowlist 1087968824' is wrong
+    advice anyway (it'd let any anonymous admin through)."""
+    payload = _text_update("yo")
+    payload["message"]["from"]["id"] = 1087968824  # @GroupAnonymousBot
+    resp = client.post("/telegram/webhook", json=payload, headers=_HEADERS)
+    assert resp.status_code == 200
+    assert len(sent_messages) == 1
+    reply = sent_messages[0]["text"].lower()
+    assert "anonymous" in reply
+    # Crucially does NOT use the misleading "invite-only / allowlist your ID"
+    # template (the user can't allowlist a Telegram-internal proxy id).
+    assert "invite-only" not in reply
+    assert "1087968824" not in reply
+
+
+def test_channel_bot_proxy_also_rejected_with_friendly_message(
+    client: TestClient,
+    sent_messages: list[dict[str, Any]],
+) -> None:
+    """@Channel_Bot (id 136817688) — the proxy for channel-as-sender —
+    gets the same friendly explanation."""
+    payload = _text_update("yo")
+    payload["message"]["from"]["id"] = 136817688  # @Channel_Bot
+    resp = client.post("/telegram/webhook", json=payload, headers=_HEADERS)
+    assert resp.status_code == 200
+    assert len(sent_messages) == 1
+    assert "anonymous" in sent_messages[0]["text"].lower()

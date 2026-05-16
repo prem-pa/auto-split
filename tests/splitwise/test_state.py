@@ -17,10 +17,14 @@ def test_mint_verify_roundtrip() -> None:
 
 def test_state_is_opaque() -> None:
     token = mint_state(42)
-    # The user id should not appear in the token (it's encrypted).
-    assert "42" not in token
-    # No PII / claims leaked in plaintext form.
+    # Fernet tokens always start with "gAAAAA" (version byte 0x80, then
+    # the timestamp and IV in URL-safe base64). Proves we returned an
+    # encrypted token, not the plaintext payload.
+    assert token.startswith("gAAAAA")
+    # No plaintext claim keys leaked.
     assert "telegram_user_id" not in token
+    assert '"u":' not in token  # JSON key for user id inside the payload
+    assert '"exp":' not in token
 
 
 def test_tampered_state_rejected() -> None:

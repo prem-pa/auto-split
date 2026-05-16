@@ -32,6 +32,40 @@ router = APIRouter(prefix="/telegram", tags=["telegram"])
 # Header Telegram sends back to us (echoing the secret we passed at setWebhook).
 _SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
 
+# Telegram proxy bots that show up as ``from_user`` when a real human is
+# posting anonymously. We can never identify the actual sender behind
+# these, so we can't allowlist them, can't store a per-user OAuth token,
+# and can't post expenses on their behalf. Refuse early with a helpful
+# message rather than letting them fall through the normal pipeline.
+_GROUP_ANONYMOUS_BOT_ID = 1087968824  # @GroupAnonymousBot
+_CHANNEL_BOT_ID = 136817688  # @Channel_Bot (anonymous channel post proxy)
+_ANONYMOUS_PROXY_IDS = frozenset({_GROUP_ANONYMOUS_BOT_ID, _CHANNEL_BOT_ID})
+
+
+def _is_anonymous_proxy(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and user.id in _ANONYMOUS_PROXY_IDS
+
+
+async def _reject_anonymous(update: Update) -> None:
+    """Reply to an anonymous-admin / channel message with a friendly explanation."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    try:
+        await send_message(
+            chat_id=chat.id,
+            text=(
+                "I can't tell who you are — this message looks like it was "
+                "sent anonymously (group admins with 'Remain Anonymous' on, "
+                "or channel posts). I need to know which Splitwise account "
+                "to use, so please disable 'Remain Anonymous' for yourself "
+                "in this group's admin settings, or DM me directly."
+            ),
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        log.exception("failed to send anonymous-sender reply to chat=%s", chat.id)
+
 
 def _verify_secret(provided: str | None) -> None:
     """Constant-time compare the secret header to ``settings.telegram_webhook_secret``.
@@ -98,6 +132,19 @@ async def _dispatch(update: Update) -> None:
 
     Phase 1 is echo-only. Brick F swaps in the real pipeline.
     """
+    # Anonymous senders (group anonymous admins, channel posts) can never
+    # be mapped to a Splitwise account; reply with a specific explanation
+    # before the allowlist gate so they don't see the cryptic "your ID is
+    # 1087968824" message.
+    if _is_anonymous_proxy(update):
+        user = update.effective_user
+        log.info(
+            "anonymous proxy sender refused id=%s",
+            user.id if user is not None else "unknown",
+        )
+        await _reject_anonymous(update)
+        return
+
     if not _is_sender_allowed(update):
         user = update.effective_user
         log.info(
