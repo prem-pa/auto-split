@@ -19,6 +19,7 @@ Privacy:
 from __future__ import annotations
 
 import logging
+import re
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import UUID
@@ -40,7 +41,7 @@ from app.db.expenses import (
     mark_completed,
 )
 from app.db.groups import list_group_members, record_membership
-from app.db.users import upsert_user
+from app.db.users import list_connected_users, upsert_user
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -60,6 +61,26 @@ from app.telegram import files as _tg_files
 from app.telegram import keyboards
 
 log = logging.getLogger(__name__)
+
+
+# In groups with privacy mode ON, the bot only sees messages that @-mention
+# it (or reply to it). Those messages arrive with "@udhaari_bot" embedded
+# in the text, which trips simple matchers — "@udhaari_bot yo" wouldn't
+# match the greeting handler because the literal text isn't "yo".
+# Telegram bot usernames are required to end in "bot", so we strip any
+# @<word>bot mention from message text/caption before downstream matching.
+_BOT_MENTION_RE = re.compile(r"@\w+bot\b", re.IGNORECASE)
+
+
+def _strip_bot_mentions(text: str) -> str:
+    """Remove ``@<botname>`` mentions and collapse whitespace.
+
+    Safe to call on any user-supplied text — it only matches handles
+    ending in ``bot`` (per Telegram's bot-username rule), so regular
+    user @-mentions like ``@hardik_username`` are untouched.
+    """
+    cleaned = _BOT_MENTION_RE.sub("", text)
+    return " ".join(cleaned.split())
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +158,7 @@ async def handle_incoming_message(update: Update) -> None:
         await _process_expense_capture(update)
         return
 
-    text = (message.text or "").strip() if message.text else ""
+    text = _strip_bot_mentions(message.text or "")
 
     # ``/start`` is special: it's the onboarding entry point. Handle it
     # before any token check so unconnected users see the OAuth link and
@@ -456,8 +477,9 @@ async def _process_expense_capture(update: Update) -> None:
 
     # Use the photo caption as a fallback / supplement when there's no
     # voice transcript (Telegram lets users add a text caption to a photo).
+    # Strip @-mentions of the bot — they're noise to the parser.
     if not transcript and message.caption:
-        transcript = message.caption
+        transcript = _strip_bot_mentions(message.caption) or None
 
     # 4. Parse with Brick D.
     try:
@@ -625,11 +647,14 @@ async def _finalize_capture(
     the steps from here on are identical: match names to group members,
     save a pending row, and post the inline-keyboard confirmation.
     """
-    # 1. Resolve split names against the actual group roster.
+    # 1. Resolve split names against the eligible roster:
+    #    - in a group: the group's actual members
+    #    - in a DM: every user who has completed Splitwise OAuth (the
+    #      sender most likely meant one of their bot-using friends).
     members_for_resolution = (
         await list_group_members(telegram_group_id)
         if telegram_group_id is not None
-        else []
+        else await list_connected_users()
     )
     resolved = resolve_split_names(
         parsed.splits,

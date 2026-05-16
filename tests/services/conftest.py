@@ -117,6 +117,10 @@ class PipelineMocks:
     sw_clients_constructed: list[str] = field(default_factory=list)
     users: dict[int, User] = field(default_factory=dict)
     group_members: dict[int, list[User]] = field(default_factory=dict)
+    # Pool returned by app.db.users.list_connected_users — used as the
+    # DM-context split-candidate roster. Tests can populate this directly
+    # or it'll auto-fill from ``users`` (any user with splitwise_user_id).
+    connected_users: list[User] | None = None
     tokens: dict[int, tuple[str, int]] = field(default_factory=dict)
     sweep_calls: list[None] = field(default_factory=list)
     sweep_return: int = 0
@@ -262,6 +266,12 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
     async def fake_list_group_members(telegram_group_id: int) -> list[User]:
         return m.group_members.get(telegram_group_id, [])
 
+    async def fake_list_connected_users() -> list[User]:
+        if m.connected_users is not None:
+            return list(m.connected_users)
+        # Auto-derive: anyone in ``users`` who has a splitwise_user_id.
+        return [u for u in m.users.values() if u.splitwise_user_id is not None]
+
     async def fake_get_user(telegram_user_id: int) -> User | None:
         return m.users.get(telegram_user_id)
 
@@ -318,6 +328,9 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
         "app.services.expense_pipeline.list_group_members", fake_list_group_members
     )
     monkeypatch.setattr(
+        "app.services.expense_pipeline.list_connected_users", fake_list_connected_users
+    )
+    monkeypatch.setattr(
         "app.services.expense_pipeline.create_pending", fake_create_pending
     )
     monkeypatch.setattr("app.services.expense_pipeline.get_pending", fake_get_pending)
@@ -330,6 +343,9 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
     # group_context goes through Brick E directly.
     monkeypatch.setattr(
         "app.services.group_context.list_group_members", fake_list_group_members
+    )
+    monkeypatch.setattr(
+        "app.services.group_context.list_connected_users", fake_list_connected_users
     )
     monkeypatch.setattr("app.services.group_context.get_user", fake_get_user)
 

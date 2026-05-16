@@ -30,14 +30,27 @@ def _fake_bot() -> Bot:
     return Bot(token="123:TEST")
 
 
-def _text_update(text: str, user_id: int = 7, chat_type: str = "private") -> Update:
+def _text_update(
+    text: str,
+    *,
+    user_id: int = 7,
+    chat_id: int | None = None,
+    chat_type: str = "private",
+) -> Update:
+    """Build a Telegram text Update.
+
+    Defaults to a DM (chat_id == user_id). Pass ``chat_id`` (typically a
+    negative number for Telegram groups) + ``chat_type="group"`` to
+    simulate an @-mention in a group.
+    """
+    cid = chat_id if chat_id is not None else user_id
     return Update.de_json(
         {
             "update_id": 1,
             "message": {
                 "message_id": 10,
                 "date": 1_700_000_000,
-                "chat": {"id": user_id, "type": chat_type},
+                "chat": {"id": cid, "type": chat_type},
                 "from": {"id": user_id, "is_bot": False, "first_name": "Tester"},
                 "text": text,
             },
@@ -221,6 +234,108 @@ async def test_greeting_with_extra_content_falls_through_to_parser(
     assert len(mocks.parser_calls) == 1
     if mocks.sent:
         assert "Hey Tester!" not in mocks.sent[0].text
+
+
+def test_strip_bot_mentions() -> None:
+    """Bot @-mentions are stripped; user @-mentions are untouched."""
+    strip = expense_pipeline._strip_bot_mentions
+    assert strip("@udhaari_bot yo") == "yo"
+    assert strip("yo @udhaari_bot") == "yo"
+    assert strip("@udhaari_bot I paid $20") == "I paid $20"
+    # Multiple bots in one message (unlikely but defensive).
+    assert strip("@some_bot @other_bot hi") == "hi"
+    # Plain user mention (no "bot" suffix) — not stripped.
+    assert strip("@hardik_username paid") == "@hardik_username paid"
+    # Whitespace collapsing.
+    assert strip("   @udhaari_bot    yo   there   ") == "yo there"
+
+
+@pytest.mark.asyncio
+async def test_group_atmention_greeting_triggers_friendly_reply(
+    mocks: PipelineMocks,
+) -> None:
+    """``@udhaari_bot yo`` in a group should be treated as a greeting
+    (mention stripped first), not fed to the parser."""
+    mocks.tokens[42] = ("token", 555)
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update(
+            "@udhaari_bot yo", user_id=42, chat_id=-1001, chat_type="supergroup"
+        )
+    )
+
+    assert len(mocks.sent) == 1
+    assert "Tester" in mocks.sent[0].text
+    assert mocks.parser_calls == []
+    # Group: membership got recorded for the sender.
+    assert (42, -1001) in mocks.memberships
+
+
+@pytest.mark.asyncio
+async def test_group_atmention_with_expense_text_strips_bot_then_parses(
+    mocks: PipelineMocks,
+) -> None:
+    """``@udhaari_bot I paid $20`` in a group: mention stripped, then
+    parser runs (because the residual is not a pure greeting)."""
+    mocks.tokens[42] = ("token", 555)
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update(
+            "@udhaari_bot I paid $20 at TJ",
+            user_id=42,
+            chat_id=-1001,
+            chat_type="supergroup",
+        )
+    )
+    assert len(mocks.parser_calls) == 1
+    # The parser sees the stripped text.
+    parser_transcript = mocks.parser_calls[0][1]
+    assert parser_transcript is not None
+    assert "udhaari_bot" not in parser_transcript
+
+
+@pytest.mark.asyncio
+async def test_dm_text_capture_resolves_against_connected_user_pool(
+    mocks: PipelineMocks,
+) -> None:
+    """In a DM, 'split with Hardik' should resolve against
+    list_connected_users (Hardik may have OAuth'd from a totally
+    different chat — there's no group roster to consult)."""
+    mocks.tokens[42] = ("token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Prem", splitwise_user_id=555
+    )
+    mocks.users[10] = User(
+        telegram_user_id=10, first_name="Hardik", splitwise_user_id=666
+    )
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("20.00"),
+        currency="USD",
+        merchant="TJ",
+        split_type="equal",
+        splits=[
+            Split(name="self", share=0.5),
+            Split(name="Hardik", share=0.5),
+        ],
+        confidence=0.9,
+    )
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update("I paid $20 at TJ split equally with Hardik", user_id=42)
+    )
+
+    # 1. Parser was told about Hardik as an available split target.
+    assert len(mocks.parser_calls) == 1
+    ctx = mocks.parser_calls[0][2]
+    assert "Hardik" in ctx.member_names
+
+    # 2. The resolved split carries Hardik's real ids, not UNRESOLVED.
+    assert len(mocks.created_pendings) == 1
+    resolved = mocks.created_pendings[0].parsed_data["_resolved"]
+    hardik = next(r for r in resolved if r["name"] == "Hardik")
+    assert hardik["telegram_user_id"] == 10
+    assert hardik["splitwise_user_id"] == 666
+    assert hardik["ambiguous"] is False
 
 
 # ---------------------------------------------------------------------------

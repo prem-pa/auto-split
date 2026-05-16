@@ -104,4 +104,30 @@ async def set_user_token(
     await asyncio.to_thread(_q)
 
 
-__all__ = ["get_user", "set_user_token", "upsert_user"]
+async def list_connected_users() -> list[User]:
+    """Return every user who has completed Splitwise OAuth.
+
+    Used as the "split candidates" pool in DM contexts, where there's no
+    group membership table to consult — the sender just says "split with
+    Hardik" and we need to know who Hardik is. Filters by
+    ``splitwise_user_id IS NOT NULL`` so we don't surface half-onboarded
+    rows where the user has identity columns but no token.
+
+    At scale we'd push the filter into SQL; at v1 (a handful of users)
+    fetching all rows and filtering in Python is simpler and just as fast.
+    """
+
+    def _q() -> list[User]:
+        client = get_supabase()
+        resp = client.table(_TABLE).select("*").execute()
+        rows = resp.data or []
+        return [
+            User.model_validate(r)
+            for r in rows
+            if r.get("splitwise_user_id") is not None
+        ]
+
+    return await asyncio.to_thread(_q)
+
+
+__all__ = ["get_user", "list_connected_users", "set_user_token", "upsert_user"]

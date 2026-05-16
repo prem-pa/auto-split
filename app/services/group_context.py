@@ -24,7 +24,7 @@ from app.ai import GroupContext
 from app.ai import Split as ParsedSplit
 from app.db.groups import list_group_members
 from app.db.models import User
-from app.db.users import get_user
+from app.db.users import get_user, list_connected_users
 
 log = logging.getLogger(__name__)
 
@@ -102,30 +102,36 @@ async def build_group_context(
         payer_telegram_user_id: The Telegram user who sent the photo.
 
     Behaviour:
-        * In a DM (no group_id) we return a context with no other members
-          and the payer's preferred currency.
-        * In a group we list every recorded membership and emit the
-          display name of each *other* connected user. The payer is
-          omitted from ``member_names`` — the parser always refers to
-          them as ``"self"``.
+        * **Group context**: list every recorded membership and emit the
+          display name of each *other* member.
+        * **DM context**: list every OAuth'd user system-wide as the
+          candidate pool. The sender naturally knows their friends are
+          on the bot and might say "split with Hardik" in a DM — we
+          treat all connected users as eligible split targets.
+
+    In both cases the payer is omitted from ``member_names`` (the parser
+    always refers to them as ``"self"``) and names are deduped.
     """
     payer = await get_user(payer_telegram_user_id)
     payer_name = _display_name(payer) if payer is not None else SELF_TOKEN
     default_currency = payer.default_currency if payer is not None else "USD"
 
-    member_names: list[str] = []
     if telegram_group_id is not None:
         members = await list_group_members(telegram_group_id)
-        seen: set[str] = set()
-        for m in members:
-            if m.telegram_user_id == payer_telegram_user_id:
-                continue
-            name = _display_name(m)
-            # Dedupe by display name so the parser doesn't see "Priya, Priya".
-            if name in seen:
-                continue
-            seen.add(name)
-            member_names.append(name)
+    else:
+        members = await list_connected_users()
+
+    member_names: list[str] = []
+    seen: set[str] = set()
+    for m in members:
+        if m.telegram_user_id == payer_telegram_user_id:
+            continue
+        name = _display_name(m)
+        # Dedupe by display name so the parser doesn't see "Priya, Priya".
+        if name in seen:
+            continue
+        seen.add(name)
+        member_names.append(name)
 
     return GroupContext(
         payer_name=payer_name,
