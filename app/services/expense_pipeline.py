@@ -43,7 +43,7 @@ from app.db.expenses import (
 from app.db.groups import record_membership
 from app.db.models import User
 from app.db.users import get_user, upsert_user
-from app.observability import observe, trace_context, update_span
+from app.observability import observe, update_span
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -142,99 +142,82 @@ async def handle_incoming_message(update: Update) -> None:
     telegram_user_id = user.id
     chat_id = chat.id
 
-    # Build tag list before opening the trace context — we want these
-    # attributes to propagate to every child span (parse, transcribe,
-    # create_expense). The configured ``settings.environment`` is added
-    # automatically inside ``trace_context``.
-    extra_tags: list[str] = ["dm" if is_private else "group"]
-    if message.photo:
-        extra_tags.append("photo")
-    if message.voice is not None:
-        extra_tags.append("voice")
-    if message.text:
-        extra_tags.append("text")
-
-    with trace_context(
-        user_id=str(telegram_user_id),
-        session_id=f"chat-{chat_id}",
-        tags=extra_tags,
-        metadata={
+    # Stamp the root Langfuse span with the sender + chat metadata so
+    # traces are filterable per-user / per-chat in the dashboard. No-op
+    # when Langfuse is disabled.
+    update_span(
+        input={
+            "telegram_user_id": telegram_user_id,
+            "chat_id": chat_id,
             "chat_type": chat.type,
-            "first_name": user.first_name or "",
+            "first_name": user.first_name,
+            "has_photo": bool(message.photo),
+            "has_voice": message.voice is not None,
+            "text_len": len(message.text or "") if message.text else 0,
         },
-    ):
-        update_span(
-            input={
-                "telegram_user_id": telegram_user_id,
-                "chat_id": chat_id,
-                "chat_type": chat.type,
-                "first_name": user.first_name,
-                "has_photo": bool(message.photo),
-                "has_voice": message.voice is not None,
-                "text_len": len(message.text or "") if message.text else 0,
-            },
+    )
+
+    # Capture identity (first_name / last_name / username) on every message
+    # so the name resolver can match natural-language references later.
+    await _capture_user_identity(user)
+
+    # Always remember the sender exists in this group, regardless of
+    # whether the message itself triggers a capture flow.
+    if not is_private:
+        try:
+            await record_membership(telegram_user_id, chat_id)
+        except Exception:  # noqa: BLE001 — best-effort; never crash dispatch
+            log.exception(
+                "record_membership failed for telegram_user_id=%s chat=%s",
+                telegram_user_id,
+                chat_id,
+            )
+
+    # Photo (+ optional voice/caption) drives the photo capture pipeline.
+    if message.photo:
+        await _process_expense_capture(update)
+        return
+
+    text = _strip_bot_mentions(message.text or "")
+
+    # ``/start`` is special: it's the onboarding entry point. Handle it
+    # before any token check so unconnected users see the OAuth link and
+    # connected users get a friendly "you're already in".
+    if text.startswith("/start"):
+        await _handle_start_command(telegram_user_id, chat_id)
+        return
+
+    # Anything else requires a connected user. Look up once and branch.
+    token_record = await load_user_token(telegram_user_id)
+    if token_record is None:
+        if is_private:
+            await _handle_unconnected_dm(telegram_user_id, chat_id)
+        # Group: deliberately silent so we don't expose someone's
+        # disconnected state in front of everyone.
+        return
+
+    # Pure greeting ("hi", "yo", "hello there") → friendly reply, skip the
+    # parser entirely. Must come before voice/text capture so "hi" doesn't
+    # get fed to Gemini and come back as a "not enough info" template.
+    if text and _is_greeting(text):
+        await _handle_greeting(chat_id, user.first_name)
+        return
+
+    # Voice without a photo → transcribe → text-only capture.
+    if message.voice is not None:
+        await _process_voice_only_capture(
+            update, voice=message.voice, token_record=token_record
         )
+        return
 
-        # Capture identity on every message so the name resolver can
-        # match natural-language references later.
-        await _capture_user_identity(user)
+    # Text without a photo → try text-only capture.
+    if text:
+        await _process_text_only_capture(
+            update, text_input=text, token_record=token_record
+        )
+        return
 
-        # Always remember the sender exists in this group, regardless
-        # of whether the message itself triggers a capture flow.
-        if not is_private:
-            try:
-                await record_membership(telegram_user_id, chat_id)
-            except Exception:  # noqa: BLE001 — best-effort; never crash dispatch
-                log.exception(
-                    "record_membership failed for telegram_user_id=%s chat=%s",
-                    telegram_user_id,
-                    chat_id,
-                )
-
-        # Photo (+ optional voice/caption) drives the photo capture pipeline.
-        if message.photo:
-            await _process_expense_capture(update)
-            return
-
-        text = _strip_bot_mentions(message.text or "")
-
-        # ``/start`` is special: it's the onboarding entry point. Handle
-        # it before any token check so unconnected users see the OAuth
-        # link and connected users get a friendly "you're already in".
-        if text.startswith("/start"):
-            await _handle_start_command(telegram_user_id, chat_id)
-            return
-
-        # Anything else requires a connected user. Look up once and branch.
-        token_record = await load_user_token(telegram_user_id)
-        if token_record is None:
-            if is_private:
-                await _handle_unconnected_dm(telegram_user_id, chat_id)
-            # Group: deliberately silent so we don't expose someone's
-            # disconnected state in front of everyone.
-            return
-
-        # Pure greeting ("hi", "yo", "hello there") → friendly reply,
-        # skip the parser entirely.
-        if text and _is_greeting(text):
-            await _handle_greeting(chat_id, user.first_name)
-            return
-
-        # Voice without a photo → transcribe → text-only capture.
-        if message.voice is not None:
-            await _process_voice_only_capture(
-                update, voice=message.voice, token_record=token_record
-            )
-            return
-
-        # Text without a photo → try text-only capture.
-        if text:
-            await _process_text_only_capture(
-                update, text_input=text, token_record=token_record
-            )
-            return
-
-        # Empty / non-text / non-media message — stay quiet.
+    # Empty / non-text / non-media message — stay quiet.
 
 
 @observe(name="callback", capture_input=False, capture_output=False)
@@ -251,59 +234,47 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
         log.warning("callback without from_user: data=%r", data)
         return
     telegram_user_id = user.id
-    callback_chat = callback_query.message.chat if callback_query.message else None
-    callback_chat_id = callback_chat.id if callback_chat is not None else None
+    update_span(
+        input={
+            "telegram_user_id": telegram_user_id,
+            "callback_data": data,
+            "first_name": user.first_name,
+        },
+    )
 
-    # Tag callback traces by environment + action prefix; session bound
-    # to the chat so the original capture trace and its later
-    # confirm/cancel/edit traces appear in the same session.
-    action_tag = data.split(":", 1)[0] if ":" in data else "unknown"
-    with trace_context(
-        user_id=str(telegram_user_id),
-        session_id=f"chat-{callback_chat_id}" if callback_chat_id else None,
-        tags=["callback", action_tag],
-    ):
-        update_span(
-            input={
-                "telegram_user_id": telegram_user_id,
-                "callback_data": data,
-                "first_name": user.first_name,
-            },
-        )
+    # Refresh identity columns on every interaction.
+    await _capture_user_identity(user)
 
-        # Refresh identity columns on every interaction.
-        await _capture_user_identity(user)
+    # Best-effort spinner clear; never let this kill the handler.
+    try:
+        await callback_query.answer()
+    except Exception:  # noqa: BLE001
+        log.exception("callback_query.answer() failed")
 
-        # Best-effort spinner clear; never let this kill the handler.
-        try:
-            await callback_query.answer()
-        except Exception:  # noqa: BLE001
-            log.exception("callback_query.answer() failed")
+    # callback_data shape: "<prefix>:<uuid_hex>". Anything else is
+    # ignored.
+    if ":" not in data:
+        log.info("callback ignored: unparseable data=%r", data)
+        return
+    prefix, _, hex_id = data.partition(":")
+    try:
+        pending_id = UUID(hex=hex_id)
+    except ValueError:
+        log.info("callback ignored: bad uuid hex=%r", hex_id)
+        return
 
-        # callback_data shape: "<prefix>:<uuid_hex>". Anything else is
-        # ignored.
-        if ":" not in data:
-            log.info("callback ignored: unparseable data=%r", data)
-            return
-        prefix, _, hex_id = data.partition(":")
-        try:
-            pending_id = UUID(hex=hex_id)
-        except ValueError:
-            log.info("callback ignored: bad uuid hex=%r", hex_id)
-            return
+    message = callback_query.message
+    chat_id = message.chat_id if message is not None else None
+    message_id = message.message_id if message is not None else None
 
-        message = callback_query.message
-        chat_id = message.chat_id if message is not None else None
-        message_id = message.message_id if message is not None else None
-
-        if prefix == keyboards.CONFIRM_PREFIX:
-            await handle_confirm(pending_id, telegram_user_id, chat_id, message_id)
-        elif prefix == keyboards.CANCEL_PREFIX:
-            await handle_cancel(pending_id, telegram_user_id, chat_id, message_id)
-        elif prefix == keyboards.EDIT_PREFIX:
-            await handle_edit(pending_id, telegram_user_id, chat_id, message_id)
-        else:
-            log.info("callback ignored: unknown prefix=%r", prefix)
+    if prefix == keyboards.CONFIRM_PREFIX:
+        await handle_confirm(pending_id, telegram_user_id, chat_id, message_id)
+    elif prefix == keyboards.CANCEL_PREFIX:
+        await handle_cancel(pending_id, telegram_user_id, chat_id, message_id)
+    elif prefix == keyboards.EDIT_PREFIX:
+        await handle_edit(pending_id, telegram_user_id, chat_id, message_id)
+    else:
+        log.info("callback ignored: unknown prefix=%r", prefix)
 
 
 # ---------------------------------------------------------------------------
