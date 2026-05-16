@@ -5,6 +5,44 @@ Format per entry: short title, date, what + why, optional notes.
 
 ---
 
+## Deploy on Raspberry Pi Zero 2 W
+**2026-05-16**
+
+Move the bot off the dev laptop onto an existing Pi Zero 2 W
+(quad-core A53, **512MB RAM**, WiFi only, microSD).
+
+**Open questions**
+- Real memory footprint under load. Rough estimate was 350-450MB
+  resident but that's a guess based on the dep list, not measurement.
+  **Decision-blocker:** measure actual RSS of `uvicorn app.main:app`
+  (no `--reload`, single worker) at idle and during a real receipt
+  capture before committing to the Pi. Use the one-liner from chat:
+    ```bash
+    PID=$(pgrep -fn "uvicorn app.main")
+    while sleep 1; do ps -o rss= -p "$PID" | awk '{printf "%6.1f MB\n", $1/1024}'; done
+    ```
+- macOS RSS vs ARM Linux RSS isn't 1:1. Mac measurement is a floor;
+  the Pi could be 20-30% higher.
+- Python 3.12 (Pi OS default) vs 3.14 (dev laptop) differ by ~5-10MB
+  at baseline.
+
+**Sketch (if feasible)**
+- Pi OS Lite 64-bit, Python 3.12, `uv` for env management.
+- `uvicorn app.main:app --workers 1` as a systemd service.
+- Named `cloudflared` tunnel as systemd service for a stable URL.
+- Systemd memory limits: `MemoryHigh=350M`, `MemoryMax=450M`,
+  `Restart=on-failure`. OOM kill → auto-restart.
+- 1GB swap file (not zram — Python's resident set can't be compressed
+  meaningfully). High-endurance microSD (Samsung PRO Endurance or
+  SanDisk Max Endurance).
+- Langfuse stays on cloud — the Pi can't run a ClickHouse stack.
+
+**Fallback paths**
+- Pi 4 4GB (~$45) if Zero 2 W OOMs too often. Same software, way more headroom.
+- Oracle Always Free as the cloud option (real reclaim risk).
+
+---
+
 ## Receipt deduplication
 **2026-05-16**
 
