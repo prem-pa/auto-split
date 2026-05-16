@@ -271,6 +271,39 @@ def test_resolve_dedupes_when_single_user_matches_multiple_candidates() -> None:
     assert out[0].telegram_user_id == 8
 
 
+def test_resolve_payer_by_their_literal_name_not_just_self() -> None:
+    """When the parser puts the payer's actual name in a split (e.g.
+    'Shreya: 33%' for a Shreya-paid expense, instead of the 'self'
+    convention), the resolver must still match her to her own user
+    record — not bail with UNRESOLVED / 'not in this group yet'.
+    """
+    shreya = User(
+        telegram_user_id=42,
+        first_name="Shreya",
+        telegram_username="shreyab03",
+        splitwise_user_id=900,
+    )
+    prem = User(telegram_user_id=8, first_name="Prem", splitwise_user_id=901)
+    members = [shreya, prem]
+
+    out = resolve_split_names(
+        [
+            Split(name="Shreya", share=0.5),  # payer named literally
+            Split(name="Prem", share=0.5),
+        ],
+        members,
+        payer_telegram_user_id=42,
+        payer_splitwise_user_id=900,
+    )
+
+    # "Shreya" resolved to her own row (not UNRESOLVED), Prem resolved too.
+    by_name = {r.name: r for r in out}
+    assert by_name["Shreya"].telegram_user_id == 42
+    assert by_name["Shreya"].splitwise_user_id == 900
+    assert not by_name["Shreya"].ambiguous
+    assert by_name["Prem"].telegram_user_id == 8
+
+
 def test_resolve_username_still_works_as_fallback() -> None:
     """If only telegram_username is set (no first_name), match still works."""
     members = [

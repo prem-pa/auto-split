@@ -197,9 +197,14 @@ def resolve_split_names(
     """Resolve each ``Split.name`` to a concrete user.
 
     Matching rules (case- and punctuation-insensitive):
-        1. ``"self"`` → the payer.
+        1. ``"self"`` → the payer (short-circuit, even if the payer's
+           User row isn't in ``group_members``).
         2. Exact match against any of a member's name candidates
            (first_name, last_name, telegram_username) — preferred.
+           The payer IS included in the candidate index, so an LLM that
+           emits the payer's actual name in splits (e.g. "Shreya: 33%"
+           when Shreya is the payer) still resolves to her, not to
+           UNRESOLVED.
         3. Prefix match across the same candidates — fallback.
         4. Anything else → :data:`UNRESOLVED`, ``ambiguous=False``.
 
@@ -212,11 +217,12 @@ def resolve_split_names(
     that to the user.
     """
     # Pre-index every (candidate -> [users]) so a single user with both a
-    # first_name and a username appears under multiple keys.
+    # first_name and a username appears under multiple keys. We include
+    # the payer in this index so resolutions like ``Split(name="Shreya")``
+    # when Shreya is also the payer don't fall off the end — "self"
+    # remains the canonical reference but the literal name works too.
     by_norm_name: dict[str, list[User]] = {}
     for m in group_members:
-        if m.telegram_user_id == payer_telegram_user_id:
-            continue
         for cand in _name_candidates(m):
             key = _normalise(cand)
             if not key:
