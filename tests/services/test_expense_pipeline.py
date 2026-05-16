@@ -295,6 +295,89 @@ async def test_group_atmention_with_expense_text_strips_bot_then_parses(
 
 
 @pytest.mark.asyncio
+async def test_named_payer_reroutes_pending_to_that_user(
+    mocks: PipelineMocks,
+) -> None:
+    """When the parser identifies a different user as the payer
+    ("Hardik paid for dinner"), the pending row's payer_telegram_user_id
+    is set to that user — so only THEY can later Confirm."""
+    # Prem (sender) and Hardik (named payer) both connected.
+    mocks.tokens[42] = ("prem-token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Prem", splitwise_user_id=555
+    )
+    mocks.users[100] = User(
+        telegram_user_id=100, first_name="Hardik", splitwise_user_id=900
+    )
+
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("30.00"),
+        currency="USD",
+        merchant="Diner",
+        split_type="equal",
+        # Parser says Hardik paid for an equal 2-way split.
+        payer="Hardik",
+        splits=[
+            Split(name="self", share=0.5),  # self in parser-speak is the payer
+            Split(name="Prem", share=0.5),
+        ],
+        confidence=0.9,
+    )
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update("Hardik paid $30 at the diner, split with me", user_id=42)
+    )
+
+    # Pending row was created keyed to Hardik (id 100), not Prem (id 42).
+    assert len(mocks.created_pendings) == 1
+    assert mocks.created_pendings[0].payer_telegram_user_id == 100
+    # Confirmation message names Hardik as the payer.
+    assert len(mocks.sent) == 1
+    reply = mocks.sent[0].text
+    assert "Paid by: Hardik" in reply
+    # "self" placeholder is replaced by the payer's name (Hardik).
+    assert "Hardik: 50%" in reply
+    # And only Hardik can confirm.
+    assert "Only Hardik can Confirm" in reply
+
+
+@pytest.mark.asyncio
+async def test_named_payer_who_is_unconnected_gets_friendly_error(
+    mocks: PipelineMocks,
+) -> None:
+    """Naming an unconnected user as the payer should fail with a
+    helpful message — we can't create an expense on an account that
+    doesn't have an OAuth token."""
+    mocks.tokens[42] = ("prem-token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Prem", splitwise_user_id=555
+    )
+    # Hardik exists but hasn't OAuth'd (no splitwise_user_id).
+    mocks.users[100] = User(
+        telegram_user_id=100, first_name="Hardik", splitwise_user_id=None
+    )
+
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("30.00"),
+        currency="USD",
+        merchant="Diner",
+        split_type="equal",
+        payer="Hardik",
+        splits=[Split(name="self", share=0.5), Split(name="Prem", share=0.5)],
+        confidence=0.9,
+    )
+
+    await expense_pipeline.handle_incoming_message(
+        _text_update("Hardik paid $30, split with me", user_id=42)
+    )
+
+    # No pending created.
+    assert mocks.created_pendings == []
+    # User-visible error mentions Hardik + /start.
+    assert any("Hardik" in m.text and "/start" in m.text for m in mocks.sent)
+
+
+@pytest.mark.asyncio
 async def test_dm_text_capture_resolves_against_connected_user_pool(
     mocks: PipelineMocks,
 ) -> None:
@@ -570,6 +653,9 @@ async def test_cancel_tap_deletes_pending_and_edits_message(
 async def test_edit_tap_prompts_resend_keeps_pending(
     mocks: PipelineMocks,
 ) -> None:
+    """Edit now sends a NEW message (so the original confirmation +
+    its keyboard remain visible) instead of editing the message body —
+    that's the UX fix the user requested."""
     pid = await _seed_pending(mocks)
     mocks.sent.clear()
     mocks.edits.clear()
@@ -577,10 +663,16 @@ async def test_edit_tap_prompts_resend_keeps_pending(
     cb_update = _callback_update(data=f"{keyboards.EDIT_PREFIX}:{pid.hex}", user_id=7)
     await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
 
-    assert pid in mocks.pendings  # NOT deleted
+    # Pending row stays — user might still tap Confirm/Cancel on the original.
+    assert pid in mocks.pendings
     assert mocks.deleted_pendings == []
-    assert len(mocks.edits) == 1
-    assert "Send the receipt again" in mocks.edits[0].text
+    # Original message NOT touched (no edit).
+    assert mocks.edits == []
+    # A separate "what to change" message was sent.
+    assert len(mocks.sent) == 1
+    reply = mocks.sent[0].text
+    assert "Send the receipt again" in reply
+    assert "Confirm or Cancel" in reply
 
 
 @pytest.mark.asyncio

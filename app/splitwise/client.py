@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
 from splitwise import Splitwise
@@ -106,12 +107,21 @@ class SplitwiseClient:
         description: str,
         group_id: int | None,
         splits: list[Split],
+        details: str | None = None,
+        expense_date: date | None = None,
     ) -> int:
         """Create an expense on Splitwise. Returns the created expense id.
 
         ``splits`` must already balance: ``sum(paid_share) == sum(owed_share)
         == cost``. We don't enforce that here — Splitwise will reject mismatches
         and surface the error via the returned error object.
+
+        Optional:
+            details: Free-form note saved on the Splitwise expense
+                (e.g. a bullet list of line items off the receipt).
+            expense_date: Calendar date for the expense — when the user
+                paid, not when the bot recorded it. Important when
+                someone uploads a receipt days late.
         """
         if not splits:
             raise ValueError("create_expense requires at least one split")
@@ -122,6 +132,17 @@ class SplitwiseClient:
         expense.setDescription(description)
         if group_id is not None:
             expense.setGroupId(group_id)
+        if details:
+            expense.setDetails(details)
+        if expense_date is not None:
+            # Splitwise's API takes ISO 8601 datetime. The wall-clock
+            # time isn't meaningful for a receipt, so we anchor to noon
+            # UTC of the given date — avoids day-shifting under odd TZ
+            # interpretations on Splitwise's side.
+            anchored = datetime.combine(
+                expense_date, time(12, 0, 0), tzinfo=timezone.utc
+            )
+            expense.setDate(anchored.isoformat().replace("+00:00", "Z"))
 
         for s in splits:
             eu = ExpenseUser()

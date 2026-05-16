@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
@@ -95,6 +96,8 @@ class CreatedExpense:
     description: str
     group_id: int | None
     splits: list[Any]
+    details: str | None = None
+    expense_date: date | None = None
 
 
 @dataclass
@@ -239,6 +242,8 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
             description: str,
             group_id: int | None,
             splits: list[Any],
+            details: str | None = None,
+            expense_date: date | None = None,
         ) -> int:
             m.sw_create_calls.append(
                 CreatedExpense(
@@ -247,6 +252,8 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
                     description=description,
                     group_id=group_id,
                     splits=splits,
+                    details=details,
+                    expense_date=expense_date,
                 )
             )
             return m.sw_create_return

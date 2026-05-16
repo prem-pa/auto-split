@@ -30,6 +30,15 @@ Rules:
     ambiguous, fall back to the default currency provided.
   - "merchant" is the business name (from the receipt or the user's text),
     or null if unclear.
+  - "receipt_date" is the calendar date printed on the receipt, in
+    ISO format ("YYYY-MM-DD"). Use null if not visible / unparseable.
+    For text-only captures with no date mentioned, leave it null —
+    do NOT guess today's date.
+  - "items" is the list of line items from the receipt body, each
+    {"name": "Bananas", "price": 2.50, "quantity": 1}. Skip totals,
+    subtotals, taxes, and tips (those are folded into "amount").
+    Return an empty list when there's no receipt or items are
+    unreadable — do NOT hallucinate items from the user's text.
   - "split_type" is the user's stated intent:
       * "equal"      — everyone pays the same fraction (the default if
                        the user does not specify how to split).
@@ -41,6 +50,12 @@ Rules:
       * "exact"      — user gave specific dollar amounts (e.g. "I had
                        $30, you had $17"). Convert each amount into a
                        fraction of the expense total.
+  - "payer" is the person who PAID the expense (the one whose money
+    came out of their wallet / card). Almost always this is the sender
+    of the message — in that case return null or "self". ONLY return a
+    different name from the provided member list when the user
+    explicitly says someone else paid (e.g. "Hardik paid for dinner,
+    split between us three" → "payer": "Hardik"). If unsure, use null.
   - "splits" is a list of {"name", "share"} pairs.
       * "name" must match either "self" (the payer) or one of the
         provided member names exactly. Do not invent names that are not

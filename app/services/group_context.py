@@ -318,11 +318,58 @@ def resolve_split_names(
     return resolved
 
 
+def find_user_by_name(name: str | None, users: list[User]) -> User | None:
+    """Match ``name`` against ``users`` and return a unique ``User``.
+
+    Same case-/punctuation-insensitive matching as :func:`resolve_split_names`
+    (exact match on any of first_name / last_name / telegram_username, then
+    prefix), but returns a single User instead of a Split. Returns ``None``
+    if there is no match OR if the name is ambiguous across multiple users.
+
+    Used by the orchestrator to resolve ``ParsedExpense.payer`` to a concrete
+    user record when someone says "Hardik paid for dinner".
+    """
+    if not name:
+        return None
+    target = _normalise(name)
+    if not target:
+        return None
+
+    # Index by every candidate name across all users.
+    by_key: dict[str, list[User]] = {}
+    for u in users:
+        for cand in _name_candidates(u):
+            key = _normalise(cand)
+            if not key:
+                continue
+            bucket = by_key.setdefault(key, [])
+            if not any(x.telegram_user_id == u.telegram_user_id for x in bucket):
+                bucket.append(u)
+
+    # Exact match wins outright (if unique).
+    exact = _dedupe_by_user(by_key.get(target, []))
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None  # ambiguous
+
+    # Prefix fallback.
+    prefix_users: list[User] = []
+    for key, members in by_key.items():
+        if key.startswith(target):
+            prefix_users.extend(members)
+    prefix_unique = _dedupe_by_user(prefix_users)
+    if len(prefix_unique) == 1:
+        return prefix_unique[0]
+    return None
+
+
 __all__ = [
     "ResolvedSplit",
     "SELF_TOKEN",
     "UNRESOLVED",
     "build_group_context",
     "eligible_split_members",
+    "find_user_by_name",
     "resolve_split_names",
 ]

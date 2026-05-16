@@ -41,12 +41,14 @@ from app.db.expenses import (
     mark_completed,
 )
 from app.db.groups import record_membership
-from app.db.users import upsert_user
+from app.db.models import User
+from app.db.users import get_user, upsert_user
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
     build_group_context,
     eligible_split_members,
+    find_user_by_name,
     resolve_split_names,
 )
 from app.splitwise import (
@@ -505,14 +507,13 @@ async def _process_expense_capture(update: Update) -> None:
         await _safe_send(chat_id, "Something went wrong parsing the receipt.")
         return
 
-    # 5-7. Common: resolve, persist, post confirmation.
+    # 5-7. Common: resolve payer + splits, persist, post confirmation.
     await _finalize_capture(
         parsed=parsed,
         message=message,
-        telegram_user_id=telegram_user_id,
+        sender_telegram_user_id=telegram_user_id,
         chat_id=chat_id,
         telegram_group_id=telegram_group_id,
-        payer_splitwise_user_id=payer_splitwise_user_id,
     )
 
 
@@ -582,10 +583,9 @@ async def _process_text_only_capture(
     await _finalize_capture(
         parsed=parsed,
         message=message,
-        telegram_user_id=telegram_user_id,
+        sender_telegram_user_id=telegram_user_id,
         chat_id=chat_id,
         telegram_group_id=telegram_group_id,
-        payer_splitwise_user_id=payer_splitwise_user_id,
     )
 
 
@@ -633,34 +633,132 @@ async def _process_voice_only_capture(
     )
 
 
+def _user_display_name(user: User) -> str:
+    """Friendly name for a user — what we show in confirmation messages."""
+    return user.first_name or user.telegram_username or f"user_{user.telegram_user_id}"
+
+
+async def _resolve_payer(
+    parsed_payer: str | None,
+    sender_telegram_user_id: int,
+    members: list[User],
+) -> User | None:
+    """Determine the actual payer of an expense.
+
+    Rules:
+      * ``parsed_payer`` is None / empty / "self" → the sender is the payer.
+      * Otherwise we match the name against the eligible-member pool. If
+        it matches the sender's own name, that's still the sender. If it
+        matches a different connected user, that user is the payer.
+
+    Returns the resolved ``User`` or ``None`` if the name is unmatchable
+    or ambiguous. ``None`` for the sender path means we couldn't even
+    find their own User row, which is a configuration problem.
+    """
+    sender_norm = ""
+    sender_user: User | None = None
+    for m in members:
+        if m.telegram_user_id == sender_telegram_user_id:
+            sender_user = m
+            break
+    if sender_user is None:
+        sender_user = await get_user(sender_telegram_user_id)
+
+    parsed_norm = (parsed_payer or "").strip().lower()
+    if not parsed_payer or parsed_norm in ("", "self"):
+        return sender_user
+
+    # If the user named themselves (e.g. by first name), treat as self.
+    if sender_user is not None:
+        for cand in (
+            sender_user.first_name,
+            sender_user.last_name,
+            sender_user.telegram_username,
+        ):
+            if cand:
+                sender_norm = cand.strip().lower()
+                if sender_norm and sender_norm == parsed_norm:
+                    return sender_user
+
+    # Otherwise look for a non-sender member who matches.
+    other_members = [
+        m for m in members if m.telegram_user_id != sender_telegram_user_id
+    ]
+    return find_user_by_name(parsed_payer, other_members)
+
+
 async def _finalize_capture(
     *,
     parsed: ParsedExpense,
     message: Any,
-    telegram_user_id: int,
+    sender_telegram_user_id: int,
     chat_id: int,
     telegram_group_id: int | None,
-    payer_splitwise_user_id: int,
 ) -> None:
-    """Common tail of every capture flow: resolve → persist → confirm.
+    """Common tail of every capture flow: resolve payer → resolve splits →
+    persist → confirm.
 
     Whether the parse came from a photo, voice transcript, or typed text,
-    the steps from here on are identical: match names to group members,
-    save a pending row, and post the inline-keyboard confirmation.
+    the steps from here on are identical: figure out who actually paid
+    (the sender by default, but anyone the user named explicitly), match
+    split names to members, save a pending row keyed to the payer, and
+    post the inline-keyboard confirmation.
     """
-    # 1. Resolve split names against the eligible roster (same rules
-    # build_group_context used when prompting the parser — see
-    # eligible_split_members docstring).
     members_for_resolution = await eligible_split_members(telegram_group_id)
+
+    # 1. Resolve the payer. If the user said "Hardik paid", we re-route
+    # the whole expense to Hardik's Splitwise account; only HE can confirm.
+    payer_user = await _resolve_payer(
+        parsed.payer, sender_telegram_user_id, members_for_resolution
+    )
+    if payer_user is None:
+        log.info(
+            "payer unresolved sender=%s parsed_payer=%r",
+            sender_telegram_user_id,
+            parsed.payer,
+        )
+        if parsed.payer:
+            await _safe_send(
+                chat_id,
+                f"I couldn't find '{parsed.payer}' here. Cancel and try "
+                "again with a clearer name, or have them DM me /start first.",
+            )
+        else:
+            await _safe_send(
+                chat_id,
+                "I couldn't find your account — try DMing me /start to reconnect.",
+            )
+        return
+
+    if payer_user.splitwise_user_id is None:
+        name = _user_display_name(payer_user)
+        if payer_user.telegram_user_id == sender_telegram_user_id:
+            await _safe_send(
+                chat_id,
+                "You haven't connected Splitwise yet — DM me /start to fix that.",
+            )
+        else:
+            await _safe_send(
+                chat_id,
+                f"{name} hasn't connected Splitwise yet. Ask them to DM me "
+                "/start first, then re-send the receipt.",
+            )
+        return
+
+    payer_telegram_user_id = payer_user.telegram_user_id
+    payer_splitwise_user_id = payer_user.splitwise_user_id
+    payer_display = _user_display_name(payer_user)
+
+    # 2. Resolve split names against the eligible roster (using the payer's
+    # IDs so "self" maps to whoever actually paid, not necessarily sender).
     resolved = resolve_split_names(
         parsed.splits,
         members_for_resolution,
-        payer_telegram_user_id=telegram_user_id,
+        payer_telegram_user_id=payer_telegram_user_id,
         payer_splitwise_user_id=payer_splitwise_user_id,
     )
 
-    # 2. Persist a pending row. Pydantic JSON mode so Decimal serialises
-    # as a number (Supabase JSONB accepts that).
+    # 3. Persist a pending row keyed to the PAYER (not the sender).
     parsed_data = parsed.model_dump(mode="json")
     parsed_data["_resolved"] = [
         {
@@ -677,16 +775,20 @@ async def _finalize_capture(
         pending = await create_pending(
             telegram_message_id=message.message_id,
             telegram_group_id=telegram_group_id,
-            payer_telegram_user_id=telegram_user_id,
+            payer_telegram_user_id=payer_telegram_user_id,
             parsed_data=parsed_data,
         )
     except Exception:  # noqa: BLE001
-        log.exception("create_pending failed telegram_user_id=%s", telegram_user_id)
+        log.exception(
+            "create_pending failed sender=%s payer=%s",
+            sender_telegram_user_id,
+            payer_telegram_user_id,
+        )
         await _safe_send(chat_id, "I couldn't save the draft. Try again?")
         return
 
-    # 3. Post confirmation message.
-    text = _format_confirmation_text(parsed, resolved)
+    # 4. Post confirmation message.
+    text = _format_confirmation_text(parsed, resolved, payer_display=payer_display)
     try:
         await _tg_bot.send_message(
             chat_id=chat_id,
@@ -695,43 +797,73 @@ async def _finalize_capture(
         )
     except Exception:  # noqa: BLE001
         log.exception(
-            "send confirmation failed pending=%s telegram_user_id=%s",
+            "send confirmation failed pending=%s sender=%s",
             pending.id,
-            telegram_user_id,
+            sender_telegram_user_id,
         )
 
     log.info(
-        "capture.ok pending=%s telegram_user_id=%s chat=%s",
+        "capture.ok pending=%s sender=%s payer=%s chat=%s",
         pending.id,
-        telegram_user_id,
+        sender_telegram_user_id,
+        payer_telegram_user_id,
         chat_id,
     )
 
 
+def _format_expense_details(parsed: ParsedExpense) -> str | None:
+    """Build the free-form ``details`` note that goes on the Splitwise expense.
+
+    Currently a bullet list of line items off the receipt, one per line.
+    Returns ``None`` when there are no items (text-only captures, or
+    receipts where Gemini couldn't read items). Splitwise displays this
+    as expense notes — visible to everyone the expense is split with.
+    """
+    if not parsed.items:
+        return None
+    lines: list[str] = []
+    for item in parsed.items:
+        qty = f"{item.quantity}× " if item.quantity and item.quantity > 1 else ""
+        # Render price with 2 decimal places; Decimal preserves precision
+        # but might render as e.g. "2.5" without quantising.
+        price = f"{item.price:.2f}"
+        lines.append(f"• {qty}{item.name} {parsed.currency} {price}")
+    return "\n".join(lines)
+
+
 def _format_confirmation_text(
-    parsed: ParsedExpense, resolved: list[ResolvedSplit]
+    parsed: ParsedExpense,
+    resolved: list[ResolvedSplit],
+    *,
+    payer_display: str,
 ) -> str:
     """Build the short confirmation summary shown alongside the buttons.
 
     Kept deliberately compact — Telegram clients clip long messages and
-    the keyboard rows below are what the user is here for.
+    the keyboard rows below are what the user is here for. The "self"
+    placeholder in splits is replaced by the resolved payer's name so
+    the reader sees "Hardik: 50%" rather than "self: 50%".
     """
     lines: list[str] = []
     merchant = parsed.merchant or "(unknown merchant)"
     lines.append(f"{merchant} — {parsed.amount} {parsed.currency}")
+    if parsed.receipt_date is not None:
+        lines.append(f"Date: {parsed.receipt_date.isoformat()}")
+    lines.append(f"Paid by: {payer_display}")
     if parsed.split_type != "equal":
         lines.append(f"Split type: {parsed.split_type}")
 
     for r in resolved:
         pct = f"{r.share * 100:.0f}%"
+        display_name = payer_display if r.name.lower() == "self" else r.name
         if r.ambiguous:
-            label = f"{r.name} (ambiguous — please verify)"
+            label = f"{display_name} (ambiguous — please verify)"
         elif r.telegram_user_id == UNRESOLVED:
-            label = f"{r.name} (not in this group yet)"
+            label = f"{display_name} (not in this group yet)"
         else:
-            label = r.name
+            label = display_name
         lines.append(f"  • {label}: {pct}")
-    lines.append("\nConfirm to add to Splitwise.")
+    lines.append(f"\nOnly {payer_display} can Confirm to add to Splitwise.")
     return "\n".join(lines)
 
 
@@ -814,6 +946,7 @@ async def handle_confirm(
 
     client = SplitwiseClient(plain_token)
     description = parsed.merchant or "Expense"
+    details = _format_expense_details(parsed)
     try:
         sw_expense_id = await client.create_expense(
             cost=parsed.amount,
@@ -821,6 +954,8 @@ async def handle_confirm(
             description=description,
             group_id=None,
             splits=sw_splits,
+            details=details,
+            expense_date=parsed.receipt_date,
         )
     except SplitwiseAPIError:
         log.warning(
@@ -914,11 +1049,13 @@ async def handle_edit(
     chat_id: int | None,
     message_id: int | None,
 ) -> None:
-    """Edit tap: tell the user to resend; pending is left for TTL.
+    """Edit tap: send a NEW message with instructions; leave the original.
 
-    v1 is intentionally dumb — per the handoff doc, per-field edit is a
-    Phase 6 concern. We don't delete the pending row so the user has a
-    window to come back and confirm if they change their mind.
+    Earlier this used ``_edit_or_send`` to replace the confirmation message
+    body — that made the receipt summary "vanish" from the user's POV and
+    they lost the ability to tap Confirm/Cancel afterwards. Now we send
+    a separate message instead, so the original confirmation (with its
+    buttons) stays live while the user reads the edit instructions.
     """
     pending = await get_pending(pending_id)
     if pending is None:
@@ -931,16 +1068,18 @@ async def handle_edit(
         and pending.payer_telegram_user_id != telegram_user_id
     ):
         if chat_id is not None:
-            await _safe_send(
-                chat_id, "Only the person who sent the receipt can edit it."
-            )
+            await _safe_send(chat_id, "Only the payer can edit this.")
         return
 
-    await _edit_or_send(
-        chat_id,
-        message_id,
-        "Send the receipt again with what you'd like to change.",
-    )
+    if chat_id is not None:
+        await _safe_send(
+            chat_id,
+            "What needs to change?\n"
+            "Send the receipt again with a corrected caption, or describe "
+            'the fix (e.g. "amount is $25", "split equally with Hardik"). '
+            "The original confirmation above stays valid — tap Confirm or "
+            "Cancel any time.",
+        )
     log.info("edit.prompt pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
 
 
