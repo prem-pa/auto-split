@@ -379,6 +379,54 @@ async def test_named_payer_who_is_unconnected_gets_friendly_error(
 
 
 @pytest.mark.asyncio
+async def test_tax_appears_in_confirmation_and_splitwise_details(
+    mocks: PipelineMocks,
+) -> None:
+    """Extracted tax is surfaced in two places: the confirmation message
+    (so the user can verify) and the Splitwise expense notes (so the
+    receipt audit trail stays intact)."""
+    from app.ai.schema import LineItem
+
+    mocks.tokens[42] = ("token", 555)
+    mocks.users[42] = User(
+        telegram_user_id=42, first_name="Prem", splitwise_user_id=555
+    )
+    mocks.parsed_expense = ParsedExpense(
+        amount=Decimal("21.95"),
+        currency="USD",
+        merchant="Trader Joe's",
+        split_type="equal",
+        splits=[Split(name="self", share=1.0)],
+        items=[
+            LineItem(name="Bananas", price=Decimal("2.50")),
+            LineItem(name="Milk", price=Decimal("4.99")),
+        ],
+        tax=Decimal("1.74"),
+        confidence=0.9,
+    )
+
+    # Capture
+    await expense_pipeline.handle_incoming_message(
+        _text_update("I paid $21.95 at TJ", user_id=42)
+    )
+    assert len(mocks.sent) == 1
+    reply = mocks.sent[0].text
+    assert "Tax: USD 1.74" in reply
+
+    # Confirm so we can see what gets sent to Splitwise.
+    pid = next(iter(mocks.pendings.keys()))
+    cb = _callback_update(f"{keyboards.CONFIRM_PREFIX}:{pid.hex}", user_id=42)
+    await expense_pipeline.handle_callback(cb.callback_query)  # type: ignore[arg-type]
+
+    assert len(mocks.sw_create_calls) == 1
+    details = mocks.sw_create_calls[0].details
+    assert details is not None
+    assert "Bananas" in details
+    assert "Milk" in details
+    assert "Tax: USD 1.74" in details
+
+
+@pytest.mark.asyncio
 async def test_sender_can_cancel_even_when_payer_is_someone_else(
     mocks: PipelineMocks,
 ) -> None:

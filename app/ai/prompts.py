@@ -39,6 +39,11 @@ Rules:
     subtotals, taxes, and tips (those are folded into "amount").
     Return an empty list when there's no receipt or items are
     unreadable — do NOT hallucinate items from the user's text.
+  - "tax" is the total tax / VAT / GST line printed on the receipt, as
+    a single number (sum of all tax lines if there are several). Null
+    when no tax is shown. "amount" is still the grand total *including*
+    tax — this field is informational so the confirmation can show it
+    and the Splitwise note can list it.
   - "split_type" is the user's stated intent:
       * "equal"      — everyone pays the same fraction (the default if
                        the user does not specify how to split).

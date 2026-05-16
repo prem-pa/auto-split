@@ -71,6 +71,11 @@ class ParsedExpense(BaseModel):
     # for receipts where line items are unreadable. Useful as the
     # ``details`` note on the Splitwise expense.
     items: list[LineItem] = Field(default_factory=list)
+    # Total tax / VAT / GST printed on the receipt, if visible. ``None``
+    # when not visible or not applicable. ``amount`` already includes
+    # this (the receipt total) — ``tax`` is informational only, surfaced
+    # in confirmation messages and Splitwise notes.
+    tax: Decimal | None = Field(default=None, ge=0)
     # Who actually paid this expense. ``None`` (or ``"self"``) means the
     # sender of the message — that's the common case. A specific name
     # means the user said someone else paid ("Hardik paid for dinner");

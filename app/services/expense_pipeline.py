@@ -819,12 +819,13 @@ async def _finalize_capture(
 def _format_expense_details(parsed: ParsedExpense) -> str | None:
     """Build the free-form ``details`` note that goes on the Splitwise expense.
 
-    Currently a bullet list of line items off the receipt, one per line.
-    Returns ``None`` when there are no items (text-only captures, or
-    receipts where Gemini couldn't read items). Splitwise displays this
-    as expense notes — visible to everyone the expense is split with.
+    Bullet list of line items off the receipt, with a final "Tax: ..."
+    line when a tax amount was extracted. Returns ``None`` when nothing
+    useful is available (text-only captures, or receipts where Gemini
+    couldn't read either items or tax). Splitwise displays this as
+    expense notes — visible to everyone the expense is split with.
     """
-    if not parsed.items:
+    if not parsed.items and parsed.tax is None:
         return None
     lines: list[str] = []
     for item in parsed.items:
@@ -833,7 +834,9 @@ def _format_expense_details(parsed: ParsedExpense) -> str | None:
         # but might render as e.g. "2.5" without quantising.
         price = f"{item.price:.2f}"
         lines.append(f"• {qty}{item.name} {parsed.currency} {price}")
-    return "\n".join(lines)
+    if parsed.tax is not None:
+        lines.append(f"Tax: {parsed.currency} {parsed.tax:.2f}")
+    return "\n".join(lines) if lines else None
 
 
 def _sender_id_from_pending(pending: Any) -> int | None:
@@ -882,6 +885,8 @@ def _format_confirmation_text(
     lines.append(f"{merchant} — {parsed.amount} {parsed.currency}")
     if parsed.receipt_date is not None:
         lines.append(f"Date: {parsed.receipt_date.isoformat()}")
+    if parsed.tax is not None:
+        lines.append(f"Tax: {parsed.currency} {parsed.tax:.2f}")
     lines.append(f"Paid by: {payer_display}")
     if parsed.split_type != "equal":
         lines.append(f"Split type: {parsed.split_type}")
