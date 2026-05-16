@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     # Fernet key for encrypting Splitwise tokens at rest
     token_encryption_key: SecretStr = SecretStr("")
 
+    # Langfuse LLM observability — optional. When both keys are set the
+    # bot emits a trace per user interaction with child spans for the
+    # transcribe + parse + create-expense calls. When unset, observability
+    # is a no-op and nothing leaves the laptop.
+    langfuse_public_key: SecretStr = SecretStr("")
+    langfuse_secret_key: SecretStr = SecretStr("")
+    langfuse_host: str = "https://us.cloud.langfuse.com"
+
     # Logging
     log_level: str = "INFO"
 

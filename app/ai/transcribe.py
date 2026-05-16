@@ -14,6 +14,7 @@ from functools import lru_cache
 from groq import Groq
 
 from app.config import settings
+from app.observability import observe, update_span
 
 _LOG = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ def _default_client() -> Groq:
     return Groq(api_key=api_key)
 
 
+@observe(name="transcribe_voice", as_type="generation", capture_input=False)
 async def transcribe_voice(
     audio: bytes,
     mime: str,
@@ -88,6 +90,13 @@ async def transcribe_voice(
 
     groq_client = client or _default_client()
     filename = _filename_for_mime(mime)
+
+    # Record metadata-only input (never raw bytes — Langfuse would try
+    # to JSON-encode them and they're not useful to humans anyway).
+    update_span(
+        input={"mime": mime, "audio_bytes_len": len(audio), "filename": filename},
+        metadata={"model": WHISPER_MODEL, "language": WHISPER_LANGUAGE},
+    )
 
     def _call() -> str:
         # Groq accepts a (filename, bytes, content_type) tuple for the
@@ -117,4 +126,7 @@ async def transcribe_voice(
     # Length only — never log the transcript content itself, which may
     # contain personal info ("split with my therapist...").
     _LOG.info("groq.transcribe.ok mime=%s chars=%d", mime, len(transcript))
+    # Span output: actual transcript (deliberately — that's what we want
+    # to *see* in the trace, since the user already opted into Langfuse).
+    update_span(output={"transcript": transcript, "chars": len(transcript)})
     return transcript

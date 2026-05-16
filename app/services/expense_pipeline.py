@@ -43,6 +43,7 @@ from app.db.expenses import (
 from app.db.groups import record_membership
 from app.db.models import User
 from app.db.users import get_user, upsert_user
+from app.observability import observe, update_span
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -112,6 +113,7 @@ async def _capture_user_identity(user: Any) -> None:
         log.exception("upsert_user (identity capture) failed user_id=%s", user.id)
 
 
+@observe(name="incoming_message", capture_input=False, capture_output=False)
 async def handle_incoming_message(update: Update) -> None:
     """Top-level message router (DMs and groups, not callbacks).
 
@@ -139,6 +141,21 @@ async def handle_incoming_message(update: Update) -> None:
     is_private = chat.type == "private"
     telegram_user_id = user.id
     chat_id = chat.id
+
+    # Stamp the root Langfuse span with the sender + chat metadata so
+    # traces are filterable per-user / per-chat in the dashboard. No-op
+    # when Langfuse is disabled.
+    update_span(
+        input={
+            "telegram_user_id": telegram_user_id,
+            "chat_id": chat_id,
+            "chat_type": chat.type,
+            "first_name": user.first_name,
+            "has_photo": bool(message.photo),
+            "has_voice": message.voice is not None,
+            "text_len": len(message.text or "") if message.text else 0,
+        },
+    )
 
     # Capture identity (first_name / last_name / username) on every message
     # so the name resolver can match natural-language references later.
@@ -203,6 +220,7 @@ async def handle_incoming_message(update: Update) -> None:
     # Empty / non-text / non-media message — stay quiet.
 
 
+@observe(name="callback", capture_input=False, capture_output=False)
 async def handle_callback(callback_query: CallbackQuery) -> None:
     """Dispatch an inline-keyboard tap based on its ``callback_data`` prefix.
 
@@ -216,6 +234,13 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
         log.warning("callback without from_user: data=%r", data)
         return
     telegram_user_id = user.id
+    update_span(
+        input={
+            "telegram_user_id": telegram_user_id,
+            "callback_data": data,
+            "first_name": user.first_name,
+        },
+    )
 
     # Refresh identity columns on every interaction.
     await _capture_user_identity(user)

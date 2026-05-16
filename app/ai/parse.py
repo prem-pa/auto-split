@@ -23,6 +23,7 @@ from app.ai.prompts import SYSTEM_PROMPT, STRICT_RETRY_SUFFIX, build_user_prompt
 from app.ai.provider import ExpenseParser, GroupContext, ParserError
 from app.ai.schema import ParsedExpense
 from app.config import settings
+from app.observability import observe, update_span
 
 # JSON Schema keys that Gemini's ``Schema`` model rejects. We strip these
 # from ``ParsedExpense.model_json_schema()`` before handing it to Gemini.
@@ -131,6 +132,7 @@ class GeminiExpenseParser(ExpenseParser):
         self._model = model or settings.gemini_model
         self._client = client or _build_default_client()
 
+    @observe(name="parse_expense", as_type="generation", capture_input=False)
     async def parse(
         self,
         image_bytes: bytes,
@@ -147,6 +149,22 @@ class GeminiExpenseParser(ExpenseParser):
         has_image = bool(image_bytes)
         user_text = build_user_prompt(transcript, context, has_image=has_image)
 
+        # Replace the default-captured input with a sanitised version
+        # (the raw image bytes are not useful to humans and would bloat
+        # every trace).
+        update_span(
+            input={
+                "has_image": has_image,
+                "image_bytes_len": len(image_bytes) if has_image else 0,
+                "transcript": transcript,
+                "payer_name": context.payer_name,
+                "member_names": context.member_names,
+                "default_currency": context.default_currency,
+                "user_prompt": user_text,
+            },
+            metadata={"model": self._model, "temperature": 0.2},
+        )
+
         contents: list[object] = []
         if has_image:
             contents.append(
@@ -160,6 +178,7 @@ class GeminiExpenseParser(ExpenseParser):
         raw = await self._generate(contents, strict_retry=False)
         parsed = _try_validate(raw)
         if parsed is not None:
+            update_span(output=parsed.model_dump(mode="json"))
             return parsed
 
         # Second (and final) attempt — same content + a stricter nudge.
@@ -169,6 +188,7 @@ class GeminiExpenseParser(ExpenseParser):
         raw = await self._generate(contents, strict_retry=True)
         parsed = _try_validate(raw)
         if parsed is not None:
+            update_span(output=parsed.model_dump(mode="json"))
             return parsed
 
         raise ParserError("Gemini did not return a valid ParsedExpense after one retry")
