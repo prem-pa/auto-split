@@ -325,12 +325,6 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
         "app.services.expense_pipeline.record_membership", fake_record_membership
     )
     monkeypatch.setattr(
-        "app.services.expense_pipeline.list_group_members", fake_list_group_members
-    )
-    monkeypatch.setattr(
-        "app.services.expense_pipeline.list_connected_users", fake_list_connected_users
-    )
-    monkeypatch.setattr(
         "app.services.expense_pipeline.create_pending", fake_create_pending
     )
     monkeypatch.setattr("app.services.expense_pipeline.get_pending", fake_get_pending)

@@ -148,8 +148,61 @@ def test_resolve_is_case_and_punctuation_insensitive() -> None:
 
 def test_module_exports_helpers() -> None:
     # Quick sanity that ``__all__`` matches what we import in callers.
-    for sym in ("build_group_context", "resolve_split_names", "UNRESOLVED"):
+    for sym in (
+        "build_group_context",
+        "eligible_split_members",
+        "resolve_split_names",
+        "UNRESOLVED",
+    ):
         assert hasattr(group_context, sym)
+
+
+# --- group context: union with connected_users ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_group_context_unions_recorded_members_with_connected_users(
+    mocks: PipelineMocks,
+) -> None:
+    """The motivating bug: Hardik posts a receipt in a group; only he and
+    Prem are in group_memberships (because Shreya has never sent a message
+    in *this* group). The bot should still know about Shreya as a split
+    candidate because she's a connected user system-wide.
+    """
+    # Payer = Hardik.
+    mocks.users[7] = User(
+        telegram_user_id=7, first_name="Hardik", splitwise_user_id=900
+    )
+    # Group_memberships: Hardik + Prem only (Shreya hasn't messaged here).
+    mocks.group_members[-100] = [
+        mocks.users[7],
+        User(telegram_user_id=8, first_name="Prem", splitwise_user_id=901),
+    ]
+    # Connected pool system-wide includes Shreya as well.
+    mocks.users[9] = User(
+        telegram_user_id=9, first_name="Shreya", splitwise_user_id=902
+    )
+
+    ctx = await build_group_context(-100, 7)
+
+    # All non-payer connected users surface in member_names, including
+    # Shreya who isn't in group_memberships yet.
+    assert sorted(ctx.member_names) == ["Prem", "Shreya"]
+
+
+@pytest.mark.asyncio
+async def test_eligible_split_members_dedupes_across_group_and_connected(
+    mocks: PipelineMocks,
+) -> None:
+    """A user who appears both in the group roster AND the connected
+    pool must only appear once in the eligible-split list."""
+    shared = User(telegram_user_id=8, first_name="Prem", splitwise_user_id=901)
+    mocks.group_members[-100] = [shared]
+    mocks.users[8] = shared  # also in connected pool
+
+    pool = await group_context.eligible_split_members(-100)
+    ids = [u.telegram_user_id for u in pool]
+    assert ids.count(8) == 1, f"Prem should appear once, got {ids}"
 
 
 # --- first_name / last_name matching --------------------------------------

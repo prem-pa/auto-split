@@ -40,12 +40,13 @@ from app.db.expenses import (
     get_pending,
     mark_completed,
 )
-from app.db.groups import list_group_members, record_membership
-from app.db.users import list_connected_users, upsert_user
+from app.db.groups import record_membership
+from app.db.users import upsert_user
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
     build_group_context,
+    eligible_split_members,
     resolve_split_names,
 )
 from app.splitwise import (
@@ -647,15 +648,10 @@ async def _finalize_capture(
     the steps from here on are identical: match names to group members,
     save a pending row, and post the inline-keyboard confirmation.
     """
-    # 1. Resolve split names against the eligible roster:
-    #    - in a group: the group's actual members
-    #    - in a DM: every user who has completed Splitwise OAuth (the
-    #      sender most likely meant one of their bot-using friends).
-    members_for_resolution = (
-        await list_group_members(telegram_group_id)
-        if telegram_group_id is not None
-        else await list_connected_users()
-    )
+    # 1. Resolve split names against the eligible roster (same rules
+    # build_group_context used when prompting the parser — see
+    # eligible_split_members docstring).
+    members_for_resolution = await eligible_split_members(telegram_group_id)
     resolved = resolve_split_names(
         parsed.splits,
         members_for_resolution,

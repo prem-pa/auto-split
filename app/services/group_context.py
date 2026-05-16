@@ -90,6 +90,37 @@ def _name_candidates(user: User) -> list[str]:
     return candidates
 
 
+async def eligible_split_members(telegram_group_id: int | None) -> list[User]:
+    """Return the candidate pool for split-name resolution.
+
+    Used by both :func:`build_group_context` (parser prompt) and the
+    orchestrator's resolve step — they must see the same set of people.
+
+    * **DM (``telegram_group_id`` is None)**: every OAuth'd user
+      system-wide. The sender knows their friends are on the bot.
+    * **Group**: union of
+        - recorded ``group_memberships`` for this Telegram group, plus
+        - every OAuth'd user system-wide.
+      The union is necessary because Telegram never gives bots the full
+      member list — we only see people who've sent at least one message
+      while the bot was watching. Without the union, a user who's a
+      Telegram-side member but hasn't yet posted is invisible to the
+      bot's resolver and won't be included in "split equally" defaults.
+
+    Returned list is deduped by ``telegram_user_id``.
+    """
+    if telegram_group_id is None:
+        return await list_connected_users()
+
+    members = await list_group_members(telegram_group_id)
+    seen_ids = {m.telegram_user_id for m in members}
+    for u in await list_connected_users():
+        if u.telegram_user_id not in seen_ids:
+            seen_ids.add(u.telegram_user_id)
+            members.append(u)
+    return members
+
+
 async def build_group_context(
     telegram_group_id: int | None,
     payer_telegram_user_id: int,
@@ -101,25 +132,16 @@ async def build_group_context(
             chat id otherwise.
         payer_telegram_user_id: The Telegram user who sent the photo.
 
-    Behaviour:
-        * **Group context**: list every recorded membership and emit the
-          display name of each *other* member.
-        * **DM context**: list every OAuth'd user system-wide as the
-          candidate pool. The sender naturally knows their friends are
-          on the bot and might say "split with Hardik" in a DM — we
-          treat all connected users as eligible split targets.
-
-    In both cases the payer is omitted from ``member_names`` (the parser
-    always refers to them as ``"self"``) and names are deduped.
+    Membership pool comes from :func:`eligible_split_members` — see its
+    docstring for the DM-vs-group rules. The payer is omitted from
+    ``member_names`` (the parser always refers to them as ``"self"``)
+    and names are deduped.
     """
     payer = await get_user(payer_telegram_user_id)
     payer_name = _display_name(payer) if payer is not None else SELF_TOKEN
     default_currency = payer.default_currency if payer is not None else "USD"
 
-    if telegram_group_id is not None:
-        members = await list_group_members(telegram_group_id)
-    else:
-        members = await list_connected_users()
+    members = await eligible_split_members(telegram_group_id)
 
     member_names: list[str] = []
     seen: set[str] = set()
@@ -301,5 +323,6 @@ __all__ = [
     "SELF_TOKEN",
     "UNRESOLVED",
     "build_group_context",
+    "eligible_split_members",
     "resolve_split_names",
 ]
