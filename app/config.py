@@ -87,6 +87,12 @@ class Settings(BaseSettings):
     langfuse_secret_key: SecretStr = SecretStr("")
     langfuse_host: str = "https://us.cloud.langfuse.com"
 
+    # Environment label applied as a Langfuse trace tag — lets you
+    # filter dev usage from real usage in the Langfuse dashboard.
+    # Conventional values: "dev", "staging", "prod". Override in .env
+    # per deploy environment. Empty string disables tagging.
+    environment: str = "dev"
+
     # Logging
     log_level: str = "INFO"
 
