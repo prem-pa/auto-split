@@ -75,7 +75,18 @@ def create_app(*, sweep_interval_seconds: float | None = None) -> FastAPI:
             except Exception:  # noqa: BLE001
                 log.exception("ttl-sweep task exited with an unexpected error")
 
-    app = FastAPI(title="auto-split", lifespan=lifespan)
+    # Disable FastAPI's auto-generated docs / schema endpoints in production.
+    # /docs (Swagger), /redoc, and /openapi.json would otherwise be publicly
+    # reachable on the ngrok URL — they don't leak secrets but they do
+    # advertise the full route inventory + request shapes to anyone who
+    # finds the URL. We only have three routes; nobody needs a UI for them.
+    app = FastAPI(
+        title="auto-split",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
