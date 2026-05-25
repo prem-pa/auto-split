@@ -479,12 +479,30 @@ def find_user_by_name(name: str | None, users: list[User]) -> User | None:
     return None
 
 
+def find_known_person(
+    name: str | None, known_people: list[KnownPerson]
+) -> KnownPerson | None:
+    """Match ``name`` against ``known_people``; return a unique friend or None.
+
+    Uses the same exact-then-prefix matching as the split resolver's
+    known-people fallback. Returns ``None`` if there is no match or the name
+    is ambiguous across several friends.
+    """
+    if not name:
+        return None
+    person, _ambiguous = _match_known_person(
+        _normalise(name), _index_known_people(known_people)
+    )
+    return person
+
+
 __all__ = [
     "ResolvedSplit",
     "SELF_TOKEN",
     "UNRESOLVED",
     "build_group_context",
     "eligible_split_members",
+    "find_known_person",
     "find_user_by_name",
     "resolve_split_names",
 ]
