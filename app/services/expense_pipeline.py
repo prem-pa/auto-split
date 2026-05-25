@@ -42,7 +42,7 @@ from app.db.expenses import (
     mark_completed,
 )
 from app.db.groups import record_membership
-from app.db.known_people import list_known_people
+from app.db.known_people import KnownPerson, list_known_people
 from app.db.models import User
 from app.db.users import get_user, upsert_user
 from app.observability import (
@@ -249,6 +249,14 @@ async def handle_incoming_message(update: Update) -> None:
             # disconnected state in front of everyone.
             return
 
+        # ``/people`` — show who the user can split with.
+        if text.startswith("/people"):
+            telegram_group_id = None if is_private else chat_id
+            await _handle_people_command(
+                telegram_user_id, chat_id, telegram_group_id
+            )
+            return
+
         # Pure greeting ("hi", "yo", "hello there") → friendly reply,
         # skip the parser entirely.
         if text and _is_greeting(text):
@@ -424,6 +432,80 @@ async def _handle_greeting(chat_id: int, first_name: str | None) -> None:
         "add it to Splitwise.\n\n"
         'Example: "I paid $24 at Trader Joe\'s, split equally with Shreya"',
     )
+    mark_conversation_end("single_turn")
+
+
+# Max names shown in a /people reply; the rest are summarised as "+N more".
+# The list is informational — resolution matches against ALL known people
+# regardless of what's displayed — so capping just keeps the message short.
+_PEOPLE_LIST_CAP = 20
+
+
+def _known_person_display_name(person: KnownPerson) -> str:
+    """Best-effort name for a cached Splitwise friend."""
+    name = " ".join(p for p in (person.first_name, person.last_name) if p).strip()
+    return name or f"Splitwise user {person.splitwise_user_id}"
+
+
+async def _handle_people_command(
+    telegram_user_id: int,
+    chat_id: int,
+    telegram_group_id: int | None,
+) -> None:
+    """Reply with who the user can split with: connected members + friends.
+
+    Purely informational — name resolution matches against every cached
+    friend regardless of what's shown — so we cap the list and point users
+    at the manual-transaction trick for anyone brand new.
+    """
+    members = await eligible_split_members(telegram_group_id)
+    names: list[str] = [
+        _user_display_name(m)
+        for m in members
+        if m.telegram_user_id != telegram_user_id
+    ]
+
+    try:
+        known = await list_known_people(telegram_user_id)
+    except Exception:  # noqa: BLE001 — degrade to members-only on any DB hiccup
+        log.exception("list_known_people failed in /people user=%s", telegram_user_id)
+        known = []
+    names.extend(_known_person_display_name(p) for p in known)
+
+    # Dedupe case-insensitively, members first.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for n in names:
+        key = n.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(n)
+
+    if not unique:
+        await _safe_send(
+            chat_id,
+            "I don't know anyone to split with yet. Add an expense with "
+            "someone in the Splitwise app, then /start me again and they'll "
+            "show up here.",
+        )
+        mark_conversation_end("single_turn")
+        return
+
+    shown = unique[:_PEOPLE_LIST_CAP]
+    lines = ["You can split with:"]
+    lines.extend(f"  • {n}" for n in shown)
+    remaining = len(unique) - len(shown)
+    if remaining > 0:
+        lines.append(
+            f"  …and {remaining} more — you don't need to see them all, "
+            "just name anyone you've split with on Splitwise."
+        )
+    lines.append(
+        "\nSomeone new? Add one expense with them in the Splitwise app, "
+        "then /start me again and I'll pick them up next time."
+    )
+    await _safe_send(chat_id, "\n".join(lines))
     mark_conversation_end("single_turn")
 
 

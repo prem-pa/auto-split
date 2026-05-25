@@ -21,15 +21,16 @@ bot only splits among connected group members (it maps
 `telegram_user_id → splitwise_user_id`), so anyone who hasn't OAuth'd is
 invisible to the splitter.
 
-**Follow-ups (not yet built):**
-- **`/people` command** — list who the user can split with (connected members
-  + cached Splitwise friends). Makes the feature discoverable and answers
-  "who does the bot know about?"
+**Follow-ups:**
+- **`/people` command — SHIPPED.** Lists connected members + cached Splitwise
+  friends (capped at 20, "+N more" beyond that — the list is informational,
+  resolution matches against all of them). Its reply explains the manual-
+  transaction trick for onboarding someone brand new.
 - **Onboarding a brand-new person without an email-invite flow:** tell the
   user to add *one* expense with them in the Splitwise app. Splitwise
   auto-friends on a shared expense, so the next sync (a `/start` away) picks
   them up. This is a zero-build alternative to the deferred email-invite UX —
-  the `/people` reply should explain it.
+  now surfaced in the `/people` reply.
 
 **Feasibility: yes, at the API level.** Splitwise's `create_expense`
 accepts participants by `user_id` *or* by `email` + `first_name`/
