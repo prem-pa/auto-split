@@ -336,7 +336,7 @@ async def test_named_payer_reroutes_pending_to_that_user(
     reply = mocks.sent[0].text
     assert "Paid by: Hardik" in reply
     # "self" placeholder is replaced by the payer's name (Hardik).
-    assert "Hardik: 50%" in reply
+    assert "Hardik: 50.00%" in reply
     # Footer reminds that Hardik is the one who taps Confirm.
     assert "Hardik" in reply.split("\n")[-1]
     assert "Confirm" in reply.split("\n")[-1]

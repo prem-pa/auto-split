@@ -58,6 +58,7 @@ from app.services.group_context import (
     UNRESOLVED,
     build_group_context,
     eligible_split_members,
+    find_known_person,
     find_user_by_name,
     resolve_split_names,
 )
@@ -249,11 +250,30 @@ async def handle_incoming_message(update: Update) -> None:
             # disconnected state in front of everyone.
             return
 
-        # ``/people`` — show who the user can split with.
+        # ``/people`` — list who the user can split with. ``/people <name>``
+        # checks a single name.
         if text.startswith("/people"):
             telegram_group_id = None if is_private else chat_id
+            query = text[len("/people") :].strip() or None
             await _handle_people_command(
-                telegram_user_id, chat_id, telegram_group_id
+                telegram_user_id,
+                chat_id,
+                telegram_group_id,
+                query=query,
+                requester_name=user.first_name,
+            )
+            return
+
+        # "Can I split with <name>?" — a capability question, not an expense.
+        can_split_name = _extract_can_split_query(text)
+        if can_split_name:
+            telegram_group_id = None if is_private else chat_id
+            await _handle_people_command(
+                telegram_user_id,
+                chat_id,
+                telegram_group_id,
+                query=can_split_name,
+                requester_name=user.first_name,
             )
             return
 
@@ -438,7 +458,26 @@ async def _handle_greeting(chat_id: int, first_name: str | None) -> None:
 # Max names shown in a /people reply; the rest are summarised as "+N more".
 # The list is informational — resolution matches against ALL known people
 # regardless of what's displayed — so capping just keeps the message short.
-_PEOPLE_LIST_CAP = 20
+# A capability question like "can I split with Cody?" — distinct from an
+# expense ("split this with Cody"). Anchored as a full match so it never
+# hijacks a real expense message that merely contains the word "split".
+_CAN_SPLIT_RE = re.compile(
+    r"^(?:can|could|may)\s+(?:i|we|you)\s+split\s+"
+    r"(?:this\s+|it\s+|the\s+bill\s+)?with\s+(?P<name>.+?)\s*\??$",
+    re.IGNORECASE,
+)
+
+# Add the manual-transaction onboarding tip to /people replies.
+_NEW_PERSON_TIP = (
+    "Someone new? Add one expense with them in the Splitwise app, "
+    "then /start me again and I'll pick them up."
+)
+
+
+def _extract_can_split_query(text: str) -> str | None:
+    """If ``text`` is a 'can I split with <name>?' question, return the name."""
+    match = _CAN_SPLIT_RE.match(text.strip())
+    return match.group("name").strip() if match else None
 
 
 def _known_person_display_name(person: KnownPerson) -> str:
@@ -451,28 +490,32 @@ async def _handle_people_command(
     telegram_user_id: int,
     chat_id: int,
     telegram_group_id: int | None,
+    *,
+    query: str | None = None,
+    requester_name: str | None = None,
 ) -> None:
-    """Reply with who the user can split with: connected members + friends.
+    """List who the user can split with, or answer "can I split with <name>?".
 
-    Purely informational — name resolution matches against every cached
-    friend regardless of what's shown — so we cap the list and point users
-    at the manual-transaction trick for anyone brand new.
+    ``query`` None → list everyone (connected members + the user's cached
+    Splitwise friends), alphabetical. A name → a yes/no for that one person.
+    ``requester_name`` personalises the list header ("Prem, you can …").
     """
     members = await eligible_split_members(telegram_group_id)
-    names: list[str] = [
-        _user_display_name(m)
-        for m in members
-        if m.telegram_user_id != telegram_user_id
-    ]
-
+    others = [m for m in members if m.telegram_user_id != telegram_user_id]
     try:
         known = await list_known_people(telegram_user_id)
     except Exception:  # noqa: BLE001 — degrade to members-only on any DB hiccup
         log.exception("list_known_people failed in /people user=%s", telegram_user_id)
         known = []
-    names.extend(_known_person_display_name(p) for p in known)
 
-    # Dedupe case-insensitively, members first.
+    if query is not None:
+        await _reply_can_split_with(chat_id, query, others, known)
+        mark_conversation_end("single_turn")
+        return
+
+    # Full roster: members + friends, deduped case-insensitively, alphabetical.
+    names = [_user_display_name(m) for m in others]
+    names.extend(_known_person_display_name(p) for p in known)
     seen: set[str] = set()
     unique: list[str] = []
     for n in names:
@@ -481,6 +524,7 @@ async def _handle_people_command(
             continue
         seen.add(key)
         unique.append(n)
+    unique.sort(key=str.lower)
 
     if not unique:
         await _safe_send(
@@ -492,21 +536,45 @@ async def _handle_people_command(
         mark_conversation_end("single_turn")
         return
 
-    shown = unique[:_PEOPLE_LIST_CAP]
-    lines = ["You can split with:"]
-    lines.extend(f"  • {n}" for n in shown)
-    remaining = len(unique) - len(shown)
-    if remaining > 0:
-        lines.append(
-            f"  …and {remaining} more — you don't need to see them all, "
-            "just name anyone you've split with on Splitwise."
-        )
-    lines.append(
-        "\nSomeone new? Add one expense with them in the Splitwise app, "
-        "then /start me again and I'll pick them up next time."
+    header = (
+        f"{requester_name.strip()}, you can split with:"
+        if requester_name and requester_name.strip()
+        else "You can split with:"
     )
+    lines = [header]
+    lines.extend(f"  • {n}" for n in unique)
+    lines.append(f"\n{_NEW_PERSON_TIP}")
     await _safe_send(chat_id, "\n".join(lines))
     mark_conversation_end("single_turn")
+
+
+async def _reply_can_split_with(
+    chat_id: int,
+    name: str,
+    members: list[User],
+    known: list[KnownPerson],
+) -> None:
+    """Answer "can I split with <name>?" — members first, then friends."""
+    member = find_user_by_name(name, members)
+    if member is not None:
+        await _safe_send(
+            chat_id,
+            f"Yes — you can split with {_user_display_name(member)} "
+            "(they're here in the chat).",
+        )
+        return
+    friend = find_known_person(name, known)
+    if friend is not None:
+        await _safe_send(
+            chat_id,
+            f"Yes — you can split with {_known_person_display_name(friend)} "
+            "(a Splitwise friend).",
+        )
+        return
+    await _safe_send(
+        chat_id,
+        f"I don't know anyone named “{name}” yet. {_NEW_PERSON_TIP}",
+    )
 
 
 async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
@@ -1100,7 +1168,7 @@ def _format_confirmation_text(
         lines.append(f"Split type: {parsed.split_type}")
 
     for r in resolved:
-        pct = f"{r.share * 100:.0f}%"
+        pct = f"{r.share * 100:.2f}%"
         display_name = payer_display if r.name.lower() == "self" else r.name
         if r.ambiguous:
             label = f"{display_name} (ambiguous — please verify)"
