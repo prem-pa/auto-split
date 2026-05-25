@@ -862,7 +862,16 @@ async def _finalize_capture(
     # IDs so "self" maps to whoever actually paid, not necessarily sender).
     # Fall back to the payer's cached Splitwise friends for names that aren't
     # connected bot members ("split with Cody" where Cody never joined).
-    known_people = await list_known_people(payer_telegram_user_id)
+    # Best-effort: if the cache table is missing (migration not yet run) or
+    # the DB hiccups, degrade to members-only rather than failing the capture.
+    try:
+        known_people = await list_known_people(payer_telegram_user_id)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "list_known_people failed payer=%s; resolving members-only",
+            payer_telegram_user_id,
+        )
+        known_people = []
     resolved = resolve_split_names(
         parsed.splits,
         members_for_resolution,
