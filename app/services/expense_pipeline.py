@@ -42,6 +42,7 @@ from app.db.expenses import (
     mark_completed,
 )
 from app.db.groups import record_membership
+from app.db.known_people import list_known_people
 from app.db.models import User
 from app.db.users import get_user, upsert_user
 from app.observability import (
@@ -60,6 +61,7 @@ from app.services.group_context import (
     find_user_by_name,
     resolve_split_names,
 )
+from app.services.known_people_sync import sync_known_people
 from app.splitwise import (
     Split as SwSplit,
     SplitwiseAPIError,
@@ -446,6 +448,14 @@ async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
         return None
 
 
+async def _sync_known_people_safe(telegram_user_id: int, plain_token: str) -> None:
+    """Best-effort refresh of a user's Splitwise friends cache. Never raises."""
+    try:
+        await sync_known_people(telegram_user_id, plain_token)
+    except Exception:  # noqa: BLE001 — contacts sync must never break a flow
+        log.exception("known_people sync failed telegram_user_id=%s", telegram_user_id)
+
+
 async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
     """Handle ``/start`` for both unconnected and already-connected users.
 
@@ -455,7 +465,9 @@ async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
     token_record = await load_user_token(telegram_user_id)
     if token_record is not None:
         # Already authenticated. Don't send another OAuth link — that's
-        # the bug this commit fixes.
+        # the bug this commit fixes. Refresh their Splitwise friends cache
+        # (best-effort) so /start doubles as "re-sync my contacts".
+        await _sync_known_people_safe(telegram_user_id, token_record[0])
         await _safe_send(
             chat_id,
             "You're already connected to Splitwise. ✓\n\n"
@@ -848,11 +860,15 @@ async def _finalize_capture(
 
     # 2. Resolve split names against the eligible roster (using the payer's
     # IDs so "self" maps to whoever actually paid, not necessarily sender).
+    # Fall back to the payer's cached Splitwise friends for names that aren't
+    # connected bot members ("split with Cody" where Cody never joined).
+    known_people = await list_known_people(payer_telegram_user_id)
     resolved = resolve_split_names(
         parsed.splits,
         members_for_resolution,
         payer_telegram_user_id=payer_telegram_user_id,
         payer_splitwise_user_id=payer_splitwise_user_id,
+        known_people=known_people,
     )
 
     # 3. Persist a pending row keyed to the PAYER (only they can Confirm
@@ -868,6 +884,7 @@ async def _finalize_capture(
             "telegram_user_id": r.telegram_user_id,
             "splitwise_user_id": r.splitwise_user_id,
             "ambiguous": r.ambiguous,
+            "external": r.external,
         }
         for r in resolved
     ]
@@ -996,6 +1013,8 @@ def _format_confirmation_text(
         display_name = payer_display if r.name.lower() == "self" else r.name
         if r.ambiguous:
             label = f"{display_name} (ambiguous — please verify)"
+        elif r.external:
+            label = f"{display_name} (Splitwise friend)"
         elif r.telegram_user_id == UNRESOLVED:
             label = f"{display_name} (not in this group yet)"
         else:

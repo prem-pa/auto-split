@@ -8,11 +8,28 @@ Format per entry: short title, date, what + why, optional notes.
 ## Split with people who aren't on the bot (but have Splitwise)
 **2026-05-25**
 
+> **v1 SHIPPED** (branch `fix/api-retries-and-observability`): friends-matching.
+> A `known_people` table caches each user's Splitwise friends (synced from
+> `getFriends()` on OAuth connect + `/start`); the resolver falls back to it
+> when a split name isn't a connected bot member, producing an `external`
+> ResolvedSplit with the friend's `splitwise_user_id`. Email-invite of brand
+> new strangers was deferred (see below).
+
 Let a user split an expense with someone who hasn't connected to the
 bot — as long as that person already has a Splitwise account. Today the
 bot only splits among connected group members (it maps
 `telegram_user_id → splitwise_user_id`), so anyone who hasn't OAuth'd is
 invisible to the splitter.
+
+**Follow-ups (not yet built):**
+- **`/people` command** — list who the user can split with (connected members
+  + cached Splitwise friends). Makes the feature discoverable and answers
+  "who does the bot know about?"
+- **Onboarding a brand-new person without an email-invite flow:** tell the
+  user to add *one* expense with them in the Splitwise app. Splitwise
+  auto-friends on a shared expense, so the next sync (a `/start` away) picks
+  them up. This is a zero-build alternative to the deferred email-invite UX —
+  the `/people` reply should explain it.
 
 **Feasibility: yes, at the API level.** Splitwise's `create_expense`
 accepts participants by `user_id` *or* by `email` + `first_name`/
@@ -29,10 +46,71 @@ person it can't resolve name → `splitwise_user_id`. Options to explore:
   member or a known friend, then split by email (Splitwise invites them).
 - Cache resolved external people per group so you don't re-ask.
 
+**Can we profile a user's split history via the API? Yes.**
+Splitwise auto-friends anyone you share an expense with, so the friends
+list *is* effectively "everyone you've split with." Sources, easiest first:
+- `getFriends()` → each friend's `id`, `first_name`, `last_name`, `email`.
+  **We already wrap this** (`SplitwiseClient.get_friends`). One call = the
+  known-people set.
+- `getGroups()` → co-members of the user's groups (also already wrapped).
+- `getExpenses()` (paginated) → historical participants, including people
+  who are no longer friends. More work; only needed for exhaustive history.
+
+**Data model: a normal table, not a graph DB.** It's a per-user adjacency
+list, which Postgres handles fine at our scale:
+```sql
+known_people (
+  owner_telegram_user_id BIGINT,
+  splitwise_user_id INTEGER,
+  first_name TEXT, last_name TEXT, email TEXT,
+  source TEXT,            -- 'friend' | 'group' | 'expense'
+  last_synced_at TIMESTAMPTZ,
+  PRIMARY KEY (owner_telegram_user_id, splitwise_user_id)
+)
+```
+Sync on OAuth connect + lazily refresh (e.g. on a cache miss during name
+resolution, or a periodic job). Then the name resolver matches "split with
+Cody" against connected members first, then this known-people set.
+
+**Scope note:** this is its own feature (schema + resolver + expense-build
+by `splitwise_user_id`/email + sync + ambiguity UX) — kept separate from
+the resilience/observability release so that can ship and fix the live bug.
+
 **Open questions**
 - Ambiguity/UX when a mentioned name matches a friend but not a member.
 - Privacy: surfacing the payer's Splitwise friend list names in a group.
 - Whether to persist these external participants for reuse.
+
+---
+
+## Item-by-item bill splitting ("help me split this")
+**2026-05-25**
+
+Instead of one split for the whole receipt, let the user split a bill
+**line by line**. Flow:
+1. User sends a photo and asks the bot to help split it.
+2. Bot first assembles a **bank of people** for this bill — asks who should
+   be included (connected members + known Splitwise people, see the idea
+   above).
+3. Bot goes **item by item** (using the receipt line items the parser
+   already extracts) and asks who shares each one:
+   - `"all"` → split across everyone in the bank.
+   - a list of names → just those people.
+   - per-item the user can choose **equal / shares / percentages**.
+4. Bot tallies each person's total (items + proportional tax/tip) and
+   creates one Splitwise expense with the computed per-person owed shares.
+
+**Why:** this is the "Sarah had the salad, Mike had the steak" case — the
+v2 item-level split called out in CLAUDE.md as explicitly *not* in v1.
+
+**Notes / open questions**
+- Leans on line-item extraction (`ParsedExpense.items`) already in the
+  parser, plus the known-people bank from the idea above — build that first.
+- Multi-turn, stateful conversation: needs to hold partial split state
+  across several messages (the conversation-session work pairs well here).
+- How to apportion tax/tip/fees across items — proportional to item cost is
+  the sane default.
+- UX for correcting a mis-assigned item without restarting the whole flow.
 
 ---
 
