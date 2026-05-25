@@ -92,6 +92,10 @@ def _name_candidates(user: User) -> list[str]:
         candidates.append(user.first_name)
     if user.last_name:
         candidates.append(user.last_name)
+    # Full "First Last" so a two-word mention ("Yash Randive") resolves and
+    # disambiguates between people who share a first name.
+    if user.first_name and user.last_name:
+        candidates.append(f"{user.first_name} {user.last_name}")
     if user.telegram_username:
         candidates.append(user.telegram_username)
     return candidates
@@ -195,12 +199,16 @@ def _dedupe_by_user(users: list[User]) -> list[User]:
 
 
 def _known_person_candidates(person: KnownPerson) -> list[str]:
-    """Names we'll accept for a Splitwise friend (first/last; no username)."""
+    """Names we'll accept for a Splitwise friend (first/last + full name)."""
     candidates: list[str] = []
     if person.first_name:
         candidates.append(person.first_name)
     if person.last_name:
         candidates.append(person.last_name)
+    # Full "First Last" so "Yash Randive" matches (and disambiguates from a
+    # second "Yash") — without it, only the separate parts are indexed.
+    if person.first_name and person.last_name:
+        candidates.append(f"{person.first_name} {person.last_name}")
     return candidates
 
 
