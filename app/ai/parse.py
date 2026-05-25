@@ -15,7 +15,9 @@ import logging
 from copy import deepcopy
 from typing import Any
 
+import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
@@ -24,6 +26,20 @@ from app.ai.provider import ExpenseParser, GroupContext, ParserError
 from app.ai.schema import ParsedExpense
 from app.config import settings
 from app.observability import observe, update_span
+from app.retry import retry_async
+
+
+def _gemini_retryable(exc: BaseException) -> bool:
+    """Retry Gemini only on transient failures: 429, 5xx, or connection errors.
+
+    Other 4xx (bad request, auth, quota-exhausted-permanently) won't succeed on
+    retry, so they propagate immediately.
+    """
+    if isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+        return code == 429 or (isinstance(code, int) and 500 <= code < 600)
+    # httpx.TransportError — connection-level, always transient.
+    return True
 
 # JSON Schema keys that Gemini's ``Schema`` model rejects. We strip these
 # from ``ParsedExpense.model_json_schema()`` before handing it to Gemini.
@@ -211,10 +227,15 @@ class GeminiExpenseParser(ExpenseParser):
             ),
             temperature=0.2,
         )
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=contents,
-            config=config,
+        response = await retry_async(
+            lambda: self._client.aio.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=config,
+            ),
+            retry_on=(genai_errors.APIError, httpx.TransportError),
+            should_retry=_gemini_retryable,
+            name="gemini generate_content",
         )
         text = _extract_text(response)
         if not text:

@@ -5,6 +5,37 @@ Format per entry: short title, date, what + why, optional notes.
 
 ---
 
+## Split with people who aren't on the bot (but have Splitwise)
+**2026-05-25**
+
+Let a user split an expense with someone who hasn't connected to the
+bot — as long as that person already has a Splitwise account. Today the
+bot only splits among connected group members (it maps
+`telegram_user_id → splitwise_user_id`), so anyone who hasn't OAuth'd is
+invisible to the splitter.
+
+**Feasibility: yes, at the API level.** Splitwise's `create_expense`
+accepts participants by `user_id` *or* by `email` + `first_name`/
+`last_name`. Adding someone by email who isn't your friend yet triggers a
+Splitwise invite — so the payer can split with anyone, bot or not.
+
+**The gap is identity mapping.** From a Telegram mention ("split with
+Cody") the bot has a *name*, not a Splitwise identity. For a non-bot
+person it can't resolve name → `splitwise_user_id`. Options to explore:
+- Pull the payer's Splitwise **friends list** (we already have their
+  token) and match the mentioned name against it — covers people who are
+  Splitwise friends but never used the bot. This is probably the 80% case.
+- Fall back to asking for an **email** when the name isn't a connected
+  member or a known friend, then split by email (Splitwise invites them).
+- Cache resolved external people per group so you don't re-ask.
+
+**Open questions**
+- Ambiguity/UX when a mentioned name matches a friend but not a member.
+- Privacy: surfacing the payer's Splitwise friend list names in a group.
+- Whether to persist these external participants for reuse.
+
+---
+
 ## Deploy on Raspberry Pi Zero 2 W
 **2026-05-16**
 

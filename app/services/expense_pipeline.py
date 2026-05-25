@@ -43,7 +43,7 @@ from app.db.expenses import (
 from app.db.groups import record_membership
 from app.db.models import User
 from app.db.users import get_user, upsert_user
-from app.observability import observe, trace_context, update_span
+from app.observability import observe, record_error, trace_context, update_span
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -171,7 +171,9 @@ async def handle_incoming_message(update: Update) -> None:
                 "first_name": user.first_name,
                 "has_photo": bool(message.photo),
                 "has_voice": message.voice is not None,
-                "text_len": len(message.text or "") if message.text else 0,
+                # A photo's text lives in ``caption``, not ``text`` — count
+                # whichever is present so photo captions aren't reported as 0.
+                "text_len": len(message.text or message.caption or ""),
             },
         )
 
@@ -300,8 +302,6 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
             await handle_confirm(pending_id, telegram_user_id, chat_id, message_id)
         elif prefix == keyboards.CANCEL_PREFIX:
             await handle_cancel(pending_id, telegram_user_id, chat_id, message_id)
-        elif prefix == keyboards.EDIT_PREFIX:
-            await handle_edit(pending_id, telegram_user_id, chat_id, message_id)
         else:
             log.info("callback ignored: unknown prefix=%r", prefix)
 
@@ -501,6 +501,7 @@ async def _process_expense_capture(update: Update) -> None:
         log.exception(
             "build_group_context failed telegram_user_id=%s", telegram_user_id
         )
+        record_error("build_group_context failed")
         await _safe_send(chat_id, "Something went wrong loading your group. Try again?")
         return
 
@@ -510,6 +511,7 @@ async def _process_expense_capture(update: Update) -> None:
         image_bytes = await _tg_files.download_telegram_file(photo.file_id)
     except Exception:  # noqa: BLE001
         log.exception("download photo failed telegram_user_id=%s", telegram_user_id)
+        record_error("photo download failed")
         await _safe_send(
             chat_id, "I couldn't fetch your photo from Telegram. Try again?"
         )
@@ -558,6 +560,7 @@ async def _process_expense_capture(update: Update) -> None:
             telegram_user_id,
             chat_id,
         )
+        record_error("parser raised")
         await _safe_send(chat_id, "Something went wrong parsing the receipt.")
         return
 
@@ -908,12 +911,12 @@ def _sender_id_from_pending(pending: Any) -> int | None:
 
 
 def _is_pending_owner(pending: Any, telegram_user_id: int) -> bool:
-    """True if ``telegram_user_id`` can Cancel or Edit ``pending``.
+    """True if ``telegram_user_id`` can Cancel ``pending``.
 
     Either the payer (whose Splitwise account is on the line) or the
-    sender (whose message kicked the whole thing off) can retract or
-    revise. Confirm stays strict — only the payer can authorise the
-    actual expense (see :func:`handle_confirm`).
+    sender (whose message kicked the whole thing off) can retract.
+    Confirm stays strict — only the payer can authorise the actual
+    expense (see :func:`handle_confirm`).
     """
     if pending.payer_telegram_user_id == telegram_user_id:
         return True
@@ -957,7 +960,7 @@ def _format_confirmation_text(
         lines.append(f"  • {label}: {pct}")
     lines.append(
         f"\n{payer_display}, tap Confirm to add to Splitwise. "
-        "Anyone here can Cancel or Edit."
+        "Anyone here can Cancel."
     )
     return "\n".join(lines)
 
@@ -1141,46 +1144,6 @@ async def handle_cancel(
     log.info("cancel.ok pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
 
 
-async def handle_edit(
-    pending_id: UUID,
-    telegram_user_id: int,
-    chat_id: int | None,
-    message_id: int | None,
-) -> None:
-    """Edit tap: send a NEW message with instructions; leave the original.
-
-    Earlier this used ``_edit_or_send`` to replace the confirmation message
-    body — that made the receipt summary "vanish" from the user's POV and
-    they lost the ability to tap Confirm/Cancel afterwards. Now we send
-    a separate message instead, so the original confirmation (with its
-    buttons) stays live while the user reads the edit instructions.
-    """
-    pending = await get_pending(pending_id)
-    if pending is None:
-        await _edit_or_send(
-            chat_id, message_id, "This expense was already handled or has expired."
-        )
-        return
-    if not _is_pending_owner(pending, telegram_user_id):
-        if chat_id is not None:
-            await _safe_send(
-                chat_id,
-                "Only the payer or whoever sent this message can edit it.",
-            )
-        return
-
-    if chat_id is not None:
-        await _safe_send(
-            chat_id,
-            "What needs to change?\n"
-            "Send the receipt again with a corrected caption, or describe "
-            'the fix (e.g. "amount is $25", "split equally with Hardik"). '
-            "The original confirmation above stays valid — tap Confirm or "
-            "Cancel any time.",
-        )
-    log.info("edit.prompt pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1287,6 +1250,5 @@ __all__ = [
     "handle_callback",
     "handle_cancel",
     "handle_confirm",
-    "handle_edit",
     "handle_incoming_message",
 ]

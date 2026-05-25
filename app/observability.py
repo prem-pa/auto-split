@@ -141,6 +141,22 @@ def update_span(
         log.exception("langfuse update_span failed")
 
 
+def record_error(message: str) -> None:
+    """Mark the current span as errored (``level="ERROR"``) with ``message``.
+
+    Use in handled-exception branches where we swallow the error and send the
+    user a friendly message — without this the trace stays at ``DEFAULT`` level
+    with a ``null`` output, indistinguishable from a success or an
+    in-progress request. No-op when Langfuse is disabled.
+    """
+    if not _LANGFUSE_ENABLED or _langfuse_client is None:
+        return
+    try:
+        _langfuse_client.update_current_span(level="ERROR", status_message=message)
+    except Exception:  # noqa: BLE001
+        log.exception("langfuse record_error failed")
+
+
 def trace_context(
     *,
     user_id: str | None = None,
@@ -196,4 +212,10 @@ def trace_context(
     )
 
 
-__all__ = ["is_enabled", "observe", "trace_context", "update_span"]
+__all__ = [
+    "is_enabled",
+    "observe",
+    "record_error",
+    "trace_context",
+    "update_span",
+]

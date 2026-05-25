@@ -2,7 +2,6 @@
 
 Callback data convention (decoded by Brick F):
     - Confirm: ``cf:<pending_id_hex>``
-    - Edit:    ``ed:<pending_id_hex>``
     - Cancel:  ``cx:<pending_id_hex>``
 
 The 32-character hex form of a UUID is used (``UUID.hex``), giving a total
@@ -16,7 +15,6 @@ from uuid import UUID
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 CONFIRM_PREFIX = "cf"
-EDIT_PREFIX = "ed"
 CANCEL_PREFIX = "cx"
 
 # Telegram limits callback_data to 64 bytes (UTF-8). Our format is always
@@ -46,19 +44,6 @@ def confirm_keyboard(pending_id: UUID) -> InlineKeyboardMarkup:
     )
 
 
-def edit_keyboard(pending_id: UUID) -> InlineKeyboardMarkup:
-    """Single-button keyboard: Edit."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "Edit", callback_data=_callback_data(EDIT_PREFIX, pending_id)
-                )
-            ]
-        ]
-    )
-
-
 def cancel_keyboard(pending_id: UUID) -> InlineKeyboardMarkup:
     """Single-button keyboard: Cancel."""
     return InlineKeyboardMarkup(
@@ -73,19 +58,12 @@ def cancel_keyboard(pending_id: UUID) -> InlineKeyboardMarkup:
 
 
 def confirmation_keyboard(pending_id: UUID) -> InlineKeyboardMarkup:
-    """Combined Confirm / Edit / Cancel keyboard (one row).
-
-    Convenience builder. Brick F (orchestrator) is free to call this or the
-    three single-button builders above depending on the UX it wants.
-    """
+    """Combined Confirm / Cancel keyboard (one row)."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     "Confirm", callback_data=_callback_data(CONFIRM_PREFIX, pending_id)
-                ),
-                InlineKeyboardButton(
-                    "Edit", callback_data=_callback_data(EDIT_PREFIX, pending_id)
                 ),
                 InlineKeyboardButton(
                     "Cancel", callback_data=_callback_data(CANCEL_PREFIX, pending_id)
