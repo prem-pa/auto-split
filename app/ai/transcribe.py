@@ -51,6 +51,13 @@ def _filename_for_mime(mime: str) -> str:
     return f"voice.{suffix}"
 
 
+# The Groq SDK retries transient failures (connection errors, 408/409/429,
+# 5xx) natively with exponential backoff + honoring Retry-After, so we just
+# raise its budget rather than wrapping with app.retry. Transcription is
+# idempotent, so extra retries are safe.
+_GROQ_MAX_RETRIES = 3
+
+
 @lru_cache(maxsize=1)
 def _default_client() -> Groq:
     """Build a Groq client once from settings."""
@@ -59,7 +66,7 @@ def _default_client() -> Groq:
         raise TranscriptionError(
             "GROQ_API_KEY is not set; cannot transcribe voice messages"
         )
-    return Groq(api_key=api_key)
+    return Groq(api_key=api_key, max_retries=_GROQ_MAX_RETRIES)
 
 
 @observe(name="transcribe_voice", as_type="generation", capture_input=False)

@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.db.expenses import sweep_expired_pending
 from app.logging_setup import configure_logging
+from app.services.expense_pipeline import mark_conversations_abandoned
 from app.splitwise import splitwise_router
 from app.telegram import telegram_router
 
@@ -32,9 +33,10 @@ async def _sweep_loop(interval_seconds: float) -> None:
     while True:
         try:
             await asyncio.sleep(interval_seconds)
-            swept = await sweep_expired_pending()
-            if swept:
-                log.info("ttl-sweep ran swept=%d", swept)
+            swept_ids = await sweep_expired_pending()
+            if swept_ids:
+                log.info("ttl-sweep ran swept=%d", len(swept_ids))
+                await mark_conversations_abandoned(swept_ids)
         except asyncio.CancelledError:
             log.info("ttl-sweep cancelled")
             raise

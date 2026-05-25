@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import logging
 import re
+from contextvars import ContextVar
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from telegram import CallbackQuery, Update
 
@@ -41,9 +42,17 @@ from app.db.expenses import (
     mark_completed,
 )
 from app.db.groups import record_membership
+from app.db.known_people import KnownPerson, list_known_people
 from app.db.models import User
 from app.db.users import get_user, upsert_user
-from app.observability import observe, trace_context, update_span
+from app.observability import (
+    is_enabled,
+    mark_conversation_end,
+    observe,
+    record_error,
+    trace_context,
+    update_span,
+)
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -52,6 +61,7 @@ from app.services.group_context import (
     find_user_by_name,
     resolve_split_names,
 )
+from app.services.known_people_sync import sync_known_people
 from app.splitwise import (
     Split as SwSplit,
     SplitwiseAPIError,
@@ -113,6 +123,23 @@ async def _capture_user_identity(user: Any) -> None:
         log.exception("upsert_user (identity capture) failed user_id=%s", user.id)
 
 
+# Per-request conversation id. Minted at the top of ``handle_incoming_message``
+# and read deep in ``_finalize_capture`` (to make it the pending expense's id)
+# without threading it through every capture function. Set per webhook task, so
+# it's request-isolated. ``None`` outside a request (e.g. the TTL sweep).
+_conversation_id: ContextVar[UUID | None] = ContextVar("conversation_id", default=None)
+
+
+def _conversation_session_id(conversation_id: UUID) -> str:
+    """The Langfuse session key for a conversation — single source of truth.
+
+    A whole add-an-expense journey (message → confirm/cancel tap) shares this
+    key because the tap carries the same id in its ``callback_data``; single-
+    turn conversations (greeting, ``/start``) are their own session.
+    """
+    return f"conv-{conversation_id.hex}"
+
+
 @observe(name="incoming_message", capture_input=False, capture_output=False)
 async def handle_incoming_message(update: Update) -> None:
     """Top-level message router (DMs and groups, not callbacks).
@@ -142,6 +169,12 @@ async def handle_incoming_message(update: Update) -> None:
     telegram_user_id = user.id
     chat_id = chat.id
 
+    # Mint the conversation id up front so it can be the trace's session key
+    # immediately AND become the pending expense's row id later (set via the
+    # context var, read in _finalize_capture). No placeholder, no update.
+    conversation_id = uuid4()
+    _conversation_id.set(conversation_id)
+
     # Build tag list before opening the trace context — we want these
     # attributes to propagate to every child span (parse, transcribe,
     # create_expense). The configured ``settings.environment`` is added
@@ -156,7 +189,7 @@ async def handle_incoming_message(update: Update) -> None:
 
     with trace_context(
         user_id=str(telegram_user_id),
-        session_id=f"chat-{chat_id}",
+        session_id=_conversation_session_id(conversation_id),
         tags=extra_tags,
         metadata={
             "chat_type": chat.type,
@@ -171,7 +204,9 @@ async def handle_incoming_message(update: Update) -> None:
                 "first_name": user.first_name,
                 "has_photo": bool(message.photo),
                 "has_voice": message.voice is not None,
-                "text_len": len(message.text or "") if message.text else 0,
+                # A photo's text lives in ``caption``, not ``text`` — count
+                # whichever is present so photo captions aren't reported as 0.
+                "text_len": len(message.text or message.caption or ""),
             },
         )
 
@@ -214,6 +249,14 @@ async def handle_incoming_message(update: Update) -> None:
             # disconnected state in front of everyone.
             return
 
+        # ``/people`` — show who the user can split with.
+        if text.startswith("/people"):
+            telegram_group_id = None if is_private else chat_id
+            await _handle_people_command(
+                telegram_user_id, chat_id, telegram_group_id
+            )
+            return
+
         # Pure greeting ("hi", "yo", "hello there") → friendly reply,
         # skip the parser entirely.
         if text and _is_greeting(text):
@@ -254,14 +297,26 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
     callback_chat = callback_query.message.chat if callback_query.message else None
     callback_chat_id = callback_chat.id if callback_chat is not None else None
 
-    # Tag callback traces by environment + action prefix; session bound
-    # to the chat so the original capture trace and its later
-    # confirm/cancel/edit traces appear in the same session.
-    action_tag = data.split(":", 1)[0] if ":" in data else "unknown"
+    # callback_data shape: "<prefix>:<uuid_hex>". Parse the id up front so the
+    # tap lands in the same Langfuse session as the message that created the
+    # pending expense (the conversation), rather than a fresh per-chat bucket.
+    prefix, _, hex_id = data.partition(":")
+    pending_id: UUID | None = None
+    if hex_id:
+        try:
+            pending_id = UUID(hex=hex_id)
+        except ValueError:
+            pending_id = None
+    session_id = (
+        _conversation_session_id(pending_id)
+        if pending_id is not None
+        else (f"chat-{callback_chat_id}" if callback_chat_id else None)
+    )
+
     with trace_context(
         user_id=str(telegram_user_id),
-        session_id=f"chat-{callback_chat_id}" if callback_chat_id else None,
-        tags=["callback", action_tag],
+        session_id=session_id,
+        tags=["callback", prefix or "unknown"],
     ):
         update_span(
             input={
@@ -280,16 +335,9 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
         except Exception:  # noqa: BLE001
             log.exception("callback_query.answer() failed")
 
-        # callback_data shape: "<prefix>:<uuid_hex>". Anything else is
-        # ignored.
-        if ":" not in data:
+        # Anything without a valid "<prefix>:<uuid_hex>" id is ignored.
+        if pending_id is None:
             log.info("callback ignored: unparseable data=%r", data)
-            return
-        prefix, _, hex_id = data.partition(":")
-        try:
-            pending_id = UUID(hex=hex_id)
-        except ValueError:
-            log.info("callback ignored: bad uuid hex=%r", hex_id)
             return
 
         message = callback_query.message
@@ -300,8 +348,6 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
             await handle_confirm(pending_id, telegram_user_id, chat_id, message_id)
         elif prefix == keyboards.CANCEL_PREFIX:
             await handle_cancel(pending_id, telegram_user_id, chat_id, message_id)
-        elif prefix == keyboards.EDIT_PREFIX:
-            await handle_edit(pending_id, telegram_user_id, chat_id, message_id)
         else:
             log.info("callback ignored: unknown prefix=%r", prefix)
 
@@ -386,6 +432,81 @@ async def _handle_greeting(chat_id: int, first_name: str | None) -> None:
         "add it to Splitwise.\n\n"
         'Example: "I paid $24 at Trader Joe\'s, split equally with Shreya"',
     )
+    mark_conversation_end("single_turn")
+
+
+# Max names shown in a /people reply; the rest are summarised as "+N more".
+# The list is informational — resolution matches against ALL known people
+# regardless of what's displayed — so capping just keeps the message short.
+_PEOPLE_LIST_CAP = 20
+
+
+def _known_person_display_name(person: KnownPerson) -> str:
+    """Best-effort name for a cached Splitwise friend."""
+    name = " ".join(p for p in (person.first_name, person.last_name) if p).strip()
+    return name or f"Splitwise user {person.splitwise_user_id}"
+
+
+async def _handle_people_command(
+    telegram_user_id: int,
+    chat_id: int,
+    telegram_group_id: int | None,
+) -> None:
+    """Reply with who the user can split with: connected members + friends.
+
+    Purely informational — name resolution matches against every cached
+    friend regardless of what's shown — so we cap the list and point users
+    at the manual-transaction trick for anyone brand new.
+    """
+    members = await eligible_split_members(telegram_group_id)
+    names: list[str] = [
+        _user_display_name(m)
+        for m in members
+        if m.telegram_user_id != telegram_user_id
+    ]
+
+    try:
+        known = await list_known_people(telegram_user_id)
+    except Exception:  # noqa: BLE001 — degrade to members-only on any DB hiccup
+        log.exception("list_known_people failed in /people user=%s", telegram_user_id)
+        known = []
+    names.extend(_known_person_display_name(p) for p in known)
+
+    # Dedupe case-insensitively, members first.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for n in names:
+        key = n.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(n)
+
+    if not unique:
+        await _safe_send(
+            chat_id,
+            "I don't know anyone to split with yet. Add an expense with "
+            "someone in the Splitwise app, then /start me again and they'll "
+            "show up here.",
+        )
+        mark_conversation_end("single_turn")
+        return
+
+    shown = unique[:_PEOPLE_LIST_CAP]
+    lines = ["You can split with:"]
+    lines.extend(f"  • {n}" for n in shown)
+    remaining = len(unique) - len(shown)
+    if remaining > 0:
+        lines.append(
+            f"  …and {remaining} more — you don't need to see them all, "
+            "just name anyone you've split with on Splitwise."
+        )
+    lines.append(
+        "\nSomeone new? Add one expense with them in the Splitwise app, "
+        "then /start me again and I'll pick them up next time."
+    )
+    await _safe_send(chat_id, "\n".join(lines))
+    mark_conversation_end("single_turn")
 
 
 async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
@@ -409,6 +530,14 @@ async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
         return None
 
 
+async def _sync_known_people_safe(telegram_user_id: int, plain_token: str) -> None:
+    """Best-effort refresh of a user's Splitwise friends cache. Never raises."""
+    try:
+        await sync_known_people(telegram_user_id, plain_token)
+    except Exception:  # noqa: BLE001 — contacts sync must never break a flow
+        log.exception("known_people sync failed telegram_user_id=%s", telegram_user_id)
+
+
 async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
     """Handle ``/start`` for both unconnected and already-connected users.
 
@@ -418,13 +547,16 @@ async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
     token_record = await load_user_token(telegram_user_id)
     if token_record is not None:
         # Already authenticated. Don't send another OAuth link — that's
-        # the bug this commit fixes.
+        # the bug this commit fixes. Refresh their Splitwise friends cache
+        # (best-effort) so /start doubles as "re-sync my contacts".
+        await _sync_known_people_safe(telegram_user_id, token_record[0])
         await _safe_send(
             chat_id,
             "You're already connected to Splitwise. ✓\n\n"
             "Send me a receipt photo, or describe the expense in text "
             '(e.g. "I paid $24 at Trader Joe\'s, split with Shreya").',
         )
+        mark_conversation_end("already_connected")
         return
 
     url = await _build_oauth_url(telegram_user_id, chat_id)
@@ -438,6 +570,7 @@ async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
         "and I'll do the rest.\n\n"
         f"Connect Splitwise: {url}",
     )
+    mark_conversation_end("onboarding_link_sent")
 
 
 async def _handle_unconnected_dm(telegram_user_id: int, chat_id: int) -> None:
@@ -501,6 +634,7 @@ async def _process_expense_capture(update: Update) -> None:
         log.exception(
             "build_group_context failed telegram_user_id=%s", telegram_user_id
         )
+        record_error("build_group_context failed")
         await _safe_send(chat_id, "Something went wrong loading your group. Try again?")
         return
 
@@ -510,6 +644,7 @@ async def _process_expense_capture(update: Update) -> None:
         image_bytes = await _tg_files.download_telegram_file(photo.file_id)
     except Exception:  # noqa: BLE001
         log.exception("download photo failed telegram_user_id=%s", telegram_user_id)
+        record_error("photo download failed")
         await _safe_send(
             chat_id, "I couldn't fetch your photo from Telegram. Try again?"
         )
@@ -558,6 +693,7 @@ async def _process_expense_capture(update: Update) -> None:
             telegram_user_id,
             chat_id,
         )
+        record_error("parser raised")
         await _safe_send(chat_id, "Something went wrong parsing the receipt.")
         return
 
@@ -632,6 +768,7 @@ async def _process_text_only_capture(
             parsed.confidence,
         )
         await _safe_send(chat_id, _NOT_ENOUGH_INFO_HINT)
+        mark_conversation_end("single_turn")
         return
 
     await _finalize_capture(
@@ -805,11 +942,24 @@ async def _finalize_capture(
 
     # 2. Resolve split names against the eligible roster (using the payer's
     # IDs so "self" maps to whoever actually paid, not necessarily sender).
+    # Fall back to the payer's cached Splitwise friends for names that aren't
+    # connected bot members ("split with Cody" where Cody never joined).
+    # Best-effort: if the cache table is missing (migration not yet run) or
+    # the DB hiccups, degrade to members-only rather than failing the capture.
+    try:
+        known_people = await list_known_people(payer_telegram_user_id)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "list_known_people failed payer=%s; resolving members-only",
+            payer_telegram_user_id,
+        )
+        known_people = []
     resolved = resolve_split_names(
         parsed.splits,
         members_for_resolution,
         payer_telegram_user_id=payer_telegram_user_id,
         payer_splitwise_user_id=payer_splitwise_user_id,
+        known_people=known_people,
     )
 
     # 3. Persist a pending row keyed to the PAYER (only they can Confirm
@@ -825,6 +975,7 @@ async def _finalize_capture(
             "telegram_user_id": r.telegram_user_id,
             "splitwise_user_id": r.splitwise_user_id,
             "ambiguous": r.ambiguous,
+            "external": r.external,
         }
         for r in resolved
     ]
@@ -832,6 +983,9 @@ async def _finalize_capture(
 
     try:
         pending = await create_pending(
+            # Adopt the conversation id as the row id so the message trace
+            # and the later confirm/cancel tap share one Langfuse session.
+            id=_conversation_id.get(),
             telegram_message_id=message.message_id,
             telegram_group_id=telegram_group_id,
             payer_telegram_user_id=payer_telegram_user_id,
@@ -908,12 +1062,12 @@ def _sender_id_from_pending(pending: Any) -> int | None:
 
 
 def _is_pending_owner(pending: Any, telegram_user_id: int) -> bool:
-    """True if ``telegram_user_id`` can Cancel or Edit ``pending``.
+    """True if ``telegram_user_id`` can Cancel ``pending``.
 
     Either the payer (whose Splitwise account is on the line) or the
-    sender (whose message kicked the whole thing off) can retract or
-    revise. Confirm stays strict — only the payer can authorise the
-    actual expense (see :func:`handle_confirm`).
+    sender (whose message kicked the whole thing off) can retract.
+    Confirm stays strict — only the payer can authorise the actual
+    expense (see :func:`handle_confirm`).
     """
     if pending.payer_telegram_user_id == telegram_user_id:
         return True
@@ -950,6 +1104,8 @@ def _format_confirmation_text(
         display_name = payer_display if r.name.lower() == "self" else r.name
         if r.ambiguous:
             label = f"{display_name} (ambiguous — please verify)"
+        elif r.external:
+            label = f"{display_name} (Splitwise friend)"
         elif r.telegram_user_id == UNRESOLVED:
             label = f"{display_name} (not in this group yet)"
         else:
@@ -957,7 +1113,7 @@ def _format_confirmation_text(
         lines.append(f"  • {label}: {pct}")
     lines.append(
         f"\n{payer_display}, tap Confirm to add to Splitwise. "
-        "Anyone here can Cancel or Edit."
+        "Anyone here can Cancel."
     )
     return "\n".join(lines)
 
@@ -1096,6 +1252,7 @@ async def handle_confirm(
         )
 
     await _edit_or_send(chat_id, message_id, "Added to Splitwise ✓")
+    mark_conversation_end("expense_created")
     log.info(
         "confirm.ok pending=%s sw_expense=%s telegram_user_id=%s",
         pending_id,
@@ -1138,47 +1295,34 @@ async def handle_cancel(
         # will eventually clean it up.
 
     await _edit_or_send(chat_id, message_id, "Cancelled.")
+    mark_conversation_end("cancelled")
     log.info("cancel.ok pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
 
 
-async def handle_edit(
-    pending_id: UUID,
-    telegram_user_id: int,
-    chat_id: int | None,
-    message_id: int | None,
-) -> None:
-    """Edit tap: send a NEW message with instructions; leave the original.
+@observe(name="expense_abandoned", capture_input=False, capture_output=False)
+async def _emit_abandoned(conversation_id: UUID) -> None:
+    """Emit one terminal 'abandoned' trace into a conversation's session."""
+    with trace_context(
+        session_id=_conversation_session_id(conversation_id),
+        tags=["abandoned"],
+    ):
+        mark_conversation_end("abandoned")
 
-    Earlier this used ``_edit_or_send`` to replace the confirmation message
-    body — that made the receipt summary "vanish" from the user's POV and
-    they lost the ability to tap Confirm/Cancel afterwards. Now we send
-    a separate message instead, so the original confirmation (with its
-    buttons) stays live while the user reads the edit instructions.
+
+async def mark_conversations_abandoned(conversation_ids: list[UUID]) -> None:
+    """Mark expired-without-a-tap conversations as abandoned in Langfuse.
+
+    Called by the TTL sweep with the ids it just deleted. A pending that
+    reaches the sweep was never confirmed or cancelled (those delete it
+    first), so it's genuinely abandoned. No-op when Langfuse is disabled.
     """
-    pending = await get_pending(pending_id)
-    if pending is None:
-        await _edit_or_send(
-            chat_id, message_id, "This expense was already handled or has expired."
-        )
+    if not is_enabled() or not conversation_ids:
         return
-    if not _is_pending_owner(pending, telegram_user_id):
-        if chat_id is not None:
-            await _safe_send(
-                chat_id,
-                "Only the payer or whoever sent this message can edit it.",
-            )
-        return
-
-    if chat_id is not None:
-        await _safe_send(
-            chat_id,
-            "What needs to change?\n"
-            "Send the receipt again with a corrected caption, or describe "
-            'the fix (e.g. "amount is $25", "split equally with Hardik"). '
-            "The original confirmation above stays valid — tap Confirm or "
-            "Cancel any time.",
-        )
-    log.info("edit.prompt pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
+    for conversation_id in conversation_ids:
+        try:
+            await _emit_abandoned(conversation_id)
+        except Exception:  # noqa: BLE001 — observability must not break the sweep
+            log.exception("failed to mark conversation abandoned id=%s", conversation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1287,6 +1431,5 @@ __all__ = [
     "handle_callback",
     "handle_cancel",
     "handle_confirm",
-    "handle_edit",
     "handle_incoming_message",
 ]

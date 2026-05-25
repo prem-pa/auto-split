@@ -125,6 +125,9 @@ class PipelineMocks:
     # or it'll auto-fill from ``users`` (any user with splitwise_user_id).
     connected_users: list[User] | None = None
     tokens: dict[int, tuple[str, int]] = field(default_factory=dict)
+    # Cached Splitwise friends per owner telegram_user_id. Empty by default,
+    # so resolution behaves bot-members-only unless a test populates it.
+    known_people: dict[int, list[Any]] = field(default_factory=dict)
     sweep_calls: list[None] = field(default_factory=list)
     sweep_return: int = 0
 
@@ -284,6 +287,7 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
 
     async def fake_create_pending(
         *,
+        id: UUID | None = None,
         telegram_message_id: int | None,
         telegram_group_id: int | None,
         payer_telegram_user_id: int | None,
@@ -299,7 +303,9 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
                 parsed_data=parsed_data,
             )
         )
-        pid = uuid4()
+        # Mirror the real create_pending: adopt the caller's id (the
+        # conversation id) when given, else mint one.
+        pid = id or uuid4()
         pending = ExpensePending(
             id=pid,
             telegram_message_id=telegram_message_id,
@@ -337,6 +343,21 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
     monkeypatch.setattr("app.services.expense_pipeline.get_pending", fake_get_pending)
     monkeypatch.setattr(
         "app.services.expense_pipeline.delete_pending", fake_delete_pending
+    )
+
+    async def fake_list_known_people(owner_telegram_user_id: int) -> list[Any]:
+        return list(m.known_people.get(owner_telegram_user_id, []))
+
+    async def fake_sync_known_people(
+        owner_telegram_user_id: int, plain_token: str
+    ) -> int:
+        return len(m.known_people.get(owner_telegram_user_id, []))
+
+    monkeypatch.setattr(
+        "app.services.expense_pipeline.list_known_people", fake_list_known_people
+    )
+    monkeypatch.setattr(
+        "app.services.expense_pipeline.sync_known_people", fake_sync_known_people
     )
     monkeypatch.setattr(
         "app.services.expense_pipeline.mark_completed", fake_mark_completed

@@ -141,6 +141,35 @@ def update_span(
         log.exception("langfuse update_span failed")
 
 
+def record_error(message: str) -> None:
+    """Mark the current span as errored (``level="ERROR"``) with ``message``.
+
+    Use in handled-exception branches where we swallow the error and send the
+    user a friendly message — without this the trace stays at ``DEFAULT`` level
+    with a ``null`` output, indistinguishable from a success or an
+    in-progress request. No-op when Langfuse is disabled.
+    """
+    if not _LANGFUSE_ENABLED or _langfuse_client is None:
+        return
+    try:
+        _langfuse_client.update_current_span(level="ERROR", status_message=message)
+    except Exception:  # noqa: BLE001
+        log.exception("langfuse record_error failed")
+
+
+def mark_conversation_end(outcome: str) -> None:
+    """Stamp the current trace as the terminal turn of a conversation.
+
+    Sets ``conversation_end=true`` + ``outcome`` on the active span's
+    metadata. Lets you tell, in Langfuse, a completed conversation
+    (``expense_created`` / ``cancelled`` / ``single_turn`` /
+    ``onboarding_link_sent`` / ``abandoned``) from one still in flight (no
+    marker) — abandoned captures never get a confirm/cancel tap, so the TTL
+    sweep stamps those. No-op when Langfuse is disabled.
+    """
+    update_span(metadata={"conversation_end": True, "outcome": outcome})
+
+
 def trace_context(
     *,
     user_id: str | None = None,
@@ -196,4 +225,11 @@ def trace_context(
     )
 
 
-__all__ = ["is_enabled", "observe", "trace_context", "update_span"]
+__all__ = [
+    "is_enabled",
+    "mark_conversation_end",
+    "observe",
+    "record_error",
+    "trace_context",
+    "update_span",
+]

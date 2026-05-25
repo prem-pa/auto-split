@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from datetime import date
 from typing import Any
 
+import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from pydantic import ValidationError
 
@@ -24,6 +27,20 @@ from app.ai.provider import ExpenseParser, GroupContext, ParserError
 from app.ai.schema import ParsedExpense
 from app.config import settings
 from app.observability import observe, update_span
+from app.retry import retry_async
+
+
+def _gemini_retryable(exc: BaseException) -> bool:
+    """Retry Gemini only on transient failures: 429, 5xx, or connection errors.
+
+    Other 4xx (bad request, auth, quota-exhausted-permanently) won't succeed on
+    retry, so they propagate immediately.
+    """
+    if isinstance(exc, genai_errors.APIError):
+        code = getattr(exc, "code", None)
+        return code == 429 or (isinstance(code, int) and 500 <= code < 600)
+    # httpx.TransportError — connection-level, always transient.
+    return True
 
 # JSON Schema keys that Gemini's ``Schema`` model rejects. We strip these
 # from ``ParsedExpense.model_json_schema()`` before handing it to Gemini.
@@ -211,10 +228,15 @@ class GeminiExpenseParser(ExpenseParser):
             ),
             temperature=0.2,
         )
-        response = await self._client.aio.models.generate_content(
-            model=self._model,
-            contents=contents,
-            config=config,
+        response = await retry_async(
+            lambda: self._client.aio.models.generate_content(
+                model=self._model,
+                contents=contents,
+                config=config,
+            ),
+            retry_on=(genai_errors.APIError, httpx.TransportError),
+            should_retry=_gemini_retryable,
+            name="gemini generate_content",
         )
         text = _extract_text(response)
         if not text:
@@ -245,7 +267,7 @@ def _extract_text(response: Any) -> str:
 def _try_validate(raw: str) -> ParsedExpense | None:
     """Validate ``raw`` against the schema; return ``None`` on failure."""
     try:
-        return ParsedExpense.model_validate_json(raw)
+        parsed = ParsedExpense.model_validate_json(raw)
     except ValidationError as exc:
         # Log only error metadata, never the full raw text — receipt
         # content is sensitive.
@@ -254,6 +276,44 @@ def _try_validate(raw: str) -> ParsedExpense | None:
     except ValueError as exc:
         _LOG.warning("gemini.parse.invalid_json type=%s", type(exc).__name__)
         return None
+    _clamp_future_receipt_date(parsed)
+    return parsed
+
+
+def _most_recent_on_or_before(month: int, day: int, today: date) -> date:
+    """Latest date with this ``month``/``day`` that is on or before ``today``.
+
+    Steps back a year at a time, skipping invalid combinations (e.g. Feb 29
+    in a non-leap year).
+    """
+    year = today.year
+    while True:
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            year -= 1
+            continue
+        if candidate <= today:
+            return candidate
+        year -= 1
+
+
+def _clamp_future_receipt_date(parsed: ParsedExpense) -> None:
+    """Roll a future ``receipt_date`` back to its most recent past occurrence.
+
+    A receipt can't be from the future, and a bare "May 9" means the *last*
+    May 9, not next year's. This is a deterministic backstop for the prompt's
+    year-inference rule: if the model picked the current year for a date that
+    hasn't happened yet (or any future date), we correct it here.
+    """
+    d = parsed.receipt_date
+    if d is None:
+        return
+    today = date.today()
+    if d <= today:
+        return
+    parsed.receipt_date = _most_recent_on_or_before(d.month, d.day, today)
+    _LOG.info("gemini.parse.receipt_date_clamped to=%s", parsed.receipt_date.isoformat())
 
 
 def _build_default_client() -> genai.Client:

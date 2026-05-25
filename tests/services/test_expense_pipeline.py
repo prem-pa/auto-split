@@ -432,7 +432,7 @@ async def test_sender_can_cancel_even_when_payer_is_someone_else(
 ) -> None:
     """Hardik types 'Shreya paid X' — pending row is keyed to Shreya
     (only she can Confirm), but Hardik should still be able to Cancel
-    the message he himself sent. Likewise Edit."""
+    the message he himself sent."""
     # Both connected.
     mocks.tokens[42] = ("hardik-token", 555)
     mocks.users[42] = User(
@@ -476,47 +476,10 @@ async def test_sender_can_cancel_even_when_payer_is_someone_else(
 
 
 @pytest.mark.asyncio
-async def test_sender_can_edit_even_when_payer_is_someone_else(
-    mocks: PipelineMocks,
-) -> None:
-    """Same setup — Hardik types 'Shreya paid X' — Hardik should be able
-    to tap Edit and get the 'send the receipt again' prompt."""
-    mocks.tokens[42] = ("hardik-token", 555)
-    mocks.users[42] = User(
-        telegram_user_id=42, first_name="Hardik", splitwise_user_id=555
-    )
-    mocks.users[100] = User(
-        telegram_user_id=100, first_name="Shreya", splitwise_user_id=900
-    )
-    mocks.parsed_expense = ParsedExpense(
-        amount=Decimal("30.00"),
-        currency="USD",
-        merchant="Coffee",
-        split_type="equal",
-        payer="Shreya",
-        splits=[Split(name="self", share=1.0)],
-        confidence=0.9,
-    )
-
-    await expense_pipeline.handle_incoming_message(
-        _text_update("Shreya paid $30", user_id=42)
-    )
-    pid = next(iter(mocks.pendings.keys()))
-    mocks.sent.clear()
-
-    cb = _callback_update(f"{keyboards.EDIT_PREFIX}:{pid.hex}", user_id=42)
-    await expense_pipeline.handle_callback(cb.callback_query)  # type: ignore[arg-type]
-
-    assert any("Send the receipt again" in m.text for m in mocks.sent)
-    # Pending stays — user might still tap Confirm/Cancel.
-    assert pid in mocks.pendings
-
-
-@pytest.mark.asyncio
 async def test_sender_still_cannot_confirm_when_payer_is_someone_else(
     mocks: PipelineMocks,
 ) -> None:
-    """Security check: even though the sender can Cancel/Edit, only the
+    """Security check: even though the sender can Cancel, only the
     payer can actually authorise the Splitwise expense."""
     mocks.tokens[42] = ("hardik-token", 555)
     mocks.users[42] = User(
@@ -825,32 +788,6 @@ async def test_cancel_tap_deletes_pending_and_edits_message(
     assert mocks.sw_create_calls == []
     assert len(mocks.edits) == 1
     assert "Cancelled" in mocks.edits[0].text
-
-
-@pytest.mark.asyncio
-async def test_edit_tap_prompts_resend_keeps_pending(
-    mocks: PipelineMocks,
-) -> None:
-    """Edit now sends a NEW message (so the original confirmation +
-    its keyboard remain visible) instead of editing the message body —
-    that's the UX fix the user requested."""
-    pid = await _seed_pending(mocks)
-    mocks.sent.clear()
-    mocks.edits.clear()
-
-    cb_update = _callback_update(data=f"{keyboards.EDIT_PREFIX}:{pid.hex}", user_id=7)
-    await expense_pipeline.handle_callback(cb_update.callback_query)  # type: ignore[arg-type]
-
-    # Pending row stays — user might still tap Confirm/Cancel on the original.
-    assert pid in mocks.pendings
-    assert mocks.deleted_pendings == []
-    # Original message NOT touched (no edit).
-    assert mocks.edits == []
-    # A separate "what to change" message was sent.
-    assert len(mocks.sent) == 1
-    reply = mocks.sent[0].text
-    assert "Send the receipt again" in reply
-    assert "Confirm or Cancel" in reply
 
 
 @pytest.mark.asyncio

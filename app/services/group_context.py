@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from app.ai import GroupContext
 from app.ai import Split as ParsedSplit
 from app.db.groups import list_group_members
+from app.db.known_people import KnownPerson
 from app.db.models import User
 from app.db.users import get_user, list_connected_users
 
@@ -52,6 +53,11 @@ class ResolvedSplit:
         ambiguous: ``True`` if the name matched more than one connected
             member; in that case ``telegram_user_id`` is :data:`UNRESOLVED`
             and the orchestrator should ask the user to clarify.
+        external: ``True`` if the name resolved to one of the payer's
+            Splitwise friends rather than a connected bot member. Such a
+            person has a real ``splitwise_user_id`` but no
+            ``telegram_user_id`` (it stays :data:`UNRESOLVED`), and the
+            expense can still be created — Splitwise only needs the id.
     """
 
     name: str
@@ -59,6 +65,7 @@ class ResolvedSplit:
     telegram_user_id: int
     splitwise_user_id: int | None
     ambiguous: bool = False
+    external: bool = False
 
 
 def _display_name(user: User) -> str:
@@ -187,12 +194,77 @@ def _dedupe_by_user(users: list[User]) -> list[User]:
     return out
 
 
+def _known_person_candidates(person: KnownPerson) -> list[str]:
+    """Names we'll accept for a Splitwise friend (first/last; no username)."""
+    candidates: list[str] = []
+    if person.first_name:
+        candidates.append(person.first_name)
+    if person.last_name:
+        candidates.append(person.last_name)
+    return candidates
+
+
+def _index_known_people(people: list[KnownPerson]) -> dict[str, list[KnownPerson]]:
+    """Index friends by every normalised name candidate, deduped by id."""
+    index: dict[str, list[KnownPerson]] = {}
+    for p in people:
+        for cand in _known_person_candidates(p):
+            key = _normalise(cand)
+            if not key:
+                continue
+            bucket = index.setdefault(key, [])
+            if not any(x.splitwise_user_id == p.splitwise_user_id for x in bucket):
+                bucket.append(p)
+    return index
+
+
+def _match_known_person(
+    norm: str, index: dict[str, list[KnownPerson]]
+) -> tuple[KnownPerson | None, bool]:
+    """Match a normalised name against the known-people index.
+
+    Same exact-then-prefix logic as member matching. Returns
+    ``(person, ambiguous)``: a unique match is ``(person, False)``, an
+    ambiguous match is ``(None, True)``, no match is ``(None, False)``.
+    """
+    if not norm:
+        return None, False
+
+    def _dedupe(people: list[KnownPerson]) -> list[KnownPerson]:
+        seen: set[int] = set()
+        out: list[KnownPerson] = []
+        for p in people:
+            if p.splitwise_user_id in seen:
+                continue
+            seen.add(p.splitwise_user_id)
+            out.append(p)
+        return out
+
+    exact = _dedupe(index.get(norm, []))
+    if len(exact) == 1:
+        return exact[0], False
+    if len(exact) > 1:
+        return None, True
+
+    prefix: list[KnownPerson] = []
+    for key, people in index.items():
+        if key.startswith(norm):
+            prefix.extend(people)
+    prefix = _dedupe(prefix)
+    if len(prefix) == 1:
+        return prefix[0], False
+    if len(prefix) > 1:
+        return None, True
+    return None, False
+
+
 def resolve_split_names(
     splits: list[ParsedSplit],
     group_members: list[User],
     *,
     payer_telegram_user_id: int,
     payer_splitwise_user_id: int | None,
+    known_people: list[KnownPerson] | None = None,
 ) -> list[ResolvedSplit]:
     """Resolve each ``Split.name`` to a concrete user.
 
@@ -206,16 +278,24 @@ def resolve_split_names(
            when Shreya is the payer) still resolves to her, not to
            UNRESOLVED.
         3. Prefix match across the same candidates — fallback.
-        4. Anything else → :data:`UNRESOLVED`, ``ambiguous=False``.
+        4. Fall back to the payer's Splitwise friends (``known_people``):
+           a unique exact-then-prefix match yields an ``external=True``
+           ResolvedSplit carrying the friend's ``splitwise_user_id``. This
+           lets the payer split with someone who has Splitwise but never
+           joined the bot.
+        5. Anything else → :data:`UNRESOLVED`, ``ambiguous=False``.
 
     Multiple distinct members matching at step 2 or 3 produce
     ``ambiguous=True``. A single member matching via multiple of their
-    own candidates is still one match (not ambiguous).
+    own candidates is still one match (not ambiguous). Connected members
+    always win over Splitwise friends — friends are only consulted when no
+    member matches at all.
 
     ``splitwise_user_id`` may be ``None`` on a resolved member if they
     haven't OAuth'd yet — the orchestrator decides whether to surface
     that to the user.
     """
+    known_index = _index_known_people(known_people or [])
     # Pre-index every (candidate -> [users]) so a single user with both a
     # first_name and a username appears under multiple keys. We include
     # the payer in this index so resolutions like ``Split(name="Shreya")``
@@ -311,7 +391,36 @@ def resolve_split_names(
             )
             continue
 
-        # 3. No match found at all.
+        # 3. No connected member matched — fall back to the payer's
+        #    Splitwise friends (people they've split with before).
+        person, person_ambiguous = _match_known_person(norm, known_index)
+        if person is not None:
+            resolved.append(
+                ResolvedSplit(
+                    name=split.name,
+                    share=split.share,
+                    telegram_user_id=UNRESOLVED,
+                    splitwise_user_id=person.splitwise_user_id,
+                    external=True,
+                )
+            )
+            continue
+        if person_ambiguous:
+            log.info(
+                "resolve_split_names: ambiguous friend name=%r", split.name
+            )
+            resolved.append(
+                ResolvedSplit(
+                    name=split.name,
+                    share=split.share,
+                    telegram_user_id=UNRESOLVED,
+                    splitwise_user_id=None,
+                    ambiguous=True,
+                )
+            )
+            continue
+
+        # 4. No match found anywhere.
         log.info("resolve_split_names: no match name=%r", split.name)
         resolved.append(
             ResolvedSplit(

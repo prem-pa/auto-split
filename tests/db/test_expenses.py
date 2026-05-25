@@ -229,11 +229,10 @@ async def test_mark_completed_respects_explicit_overrides(
 async def test_sweep_expired_pending_returns_count(
     fake_supabase: FakeSupabaseClient,
 ) -> None:
-    fake_supabase.queue(
-        [{"id": str(uuid4())}, {"id": str(uuid4())}, {"id": str(uuid4())}]
-    )
-    n = await expenses.sweep_expired_pending()
-    assert n == 3
+    ids = [uuid4(), uuid4(), uuid4()]
+    fake_supabase.queue([{"id": str(i)} for i in ids])
+    deleted = await expenses.sweep_expired_pending()
+    assert deleted == ids
     table, chain = fake_supabase.calls[0]
     assert table == "expenses_pending"
     assert chain[0].method == "delete"
@@ -247,5 +246,5 @@ async def test_sweep_expired_pending_zero_when_none(
     fake_supabase: FakeSupabaseClient,
 ) -> None:
     fake_supabase.queue([])
-    n = await expenses.sweep_expired_pending()
-    assert n == 0
+    deleted = await expenses.sweep_expired_pending()
+    assert deleted == []

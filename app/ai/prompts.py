@@ -7,6 +7,8 @@ the network or read env vars.
 
 from __future__ import annotations
 
+from datetime import date
+
 from app.ai.provider import GroupContext
 
 SYSTEM_PROMPT = """\
@@ -30,10 +32,14 @@ Rules:
     ambiguous, fall back to the default currency provided.
   - "merchant" is the business name (from the receipt or the user's text),
     or null if unclear.
-  - "receipt_date" is the calendar date printed on the receipt, in
-    ISO format ("YYYY-MM-DD"). Use null if not visible / unparseable.
-    For text-only captures with no date mentioned, leave it null —
-    do NOT guess today's date.
+  - "receipt_date" is the calendar date of the expense, in ISO format
+    ("YYYY-MM-DD"). Prefer the date printed on the receipt. If a date is
+    mentioned without a year (e.g. "May 9"), resolve it to the most recent
+    occurrence on or before today's date (given below): the current year if
+    that month and day have already passed this year, otherwise the previous
+    year. NEVER return a date in the future. Use null if no date is visible
+    or mentioned; for text-only captures with no date, do NOT guess today's
+    date.
   - "items" is the list of line items from the receipt body, each
     {"name": "Bananas", "price": 2.50, "quantity": 1}. Skip totals,
     subtotals, taxes, and tips (those are folded into "amount").
@@ -89,13 +95,17 @@ def build_user_prompt(
     context: GroupContext,
     *,
     has_image: bool = True,
+    today: date | None = None,
 ) -> str:
     """Build the per-request text portion of the Gemini prompt.
 
-    Includes payer name, member names, default currency, the user
-    instruction (if any), and a flag telling the model whether an image
-    is part of the request.
+    Includes today's date (so the model can resolve bare dates like
+    "May 9" to the right year), payer name, member names, default
+    currency, the user instruction (if any), and a flag telling the model
+    whether an image is part of the request. ``today`` defaults to the
+    current date; tests pass a fixed value.
     """
+    today = today or date.today()
     others = ", ".join(context.member_names) if context.member_names else "(none)"
     instruction = (transcript or "").strip() or "(no instruction supplied)"
     image_note = (
@@ -104,6 +114,7 @@ def build_user_prompt(
         else "Receipt image: NOT provided — derive the amount and merchant from the user instruction alone."
     )
     return (
+        f"Today's date is {today.isoformat()}.\n"
         f'Payer: {context.payer_name} (use the name "self" for them in splits).\n'
         f"Group members available to split with: {others}.\n"
         f"Default currency if unclear: {context.default_currency}.\n"

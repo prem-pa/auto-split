@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,9 +16,9 @@ async def test_lifespan_spawns_sweep_and_cancels_cleanly(
 ) -> None:
     calls: list[None] = []
 
-    async def fake_sweep() -> int:
+    async def fake_sweep() -> list[UUID]:
         calls.append(None)
-        return 0
+        return []
 
     # Patch where ``_sweep_loop`` resolves it.
     monkeypatch.setattr("app.main.sweep_expired_pending", fake_sweep)
@@ -43,11 +44,11 @@ async def test_lifespan_swallows_sweep_errors_and_keeps_ticking(
 ) -> None:
     calls: list[None] = []
 
-    async def flaky_sweep() -> int:
+    async def flaky_sweep() -> list[UUID]:
         calls.append(None)
         if len(calls) == 1:
             raise RuntimeError("transient supabase blip")
-        return 3
+        return [uuid4(), uuid4(), uuid4()]
 
     monkeypatch.setattr("app.main.sweep_expired_pending", flaky_sweep)
 

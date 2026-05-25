@@ -29,6 +29,7 @@ from fastapi.responses import HTMLResponse
 from splitwise import Splitwise
 
 from app.config import settings
+from app.services.known_people_sync import sync_known_people
 from app.splitwise.state import InvalidState, verify_state
 from app.splitwise.storage import save_user_token
 
@@ -219,6 +220,16 @@ async def oauth_callback(
         telegram_user_id,
         splitwise_user_id,
     )
+    # Seed the user's Splitwise friends into the known-people cache so they
+    # can immediately split with people who aren't on the bot. Best-effort:
+    # a failure must not break the just-completed connection.
+    try:
+        await sync_known_people(telegram_user_id, access_token)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "known_people sync failed after oauth telegram_user_id=%s",
+            telegram_user_id,
+        )
     return HTMLResponse(content=_SUCCESS_PAGE, status_code=status.HTTP_200_OK)
 
 

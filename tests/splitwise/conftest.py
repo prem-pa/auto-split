@@ -48,6 +48,16 @@ def _patch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _stub_known_people_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the post-OAuth friends sync so callback tests don't hit Splitwise."""
+
+    async def _noop(owner_telegram_user_id: int, plain_token: str) -> int:
+        return 0
+
+    monkeypatch.setattr("app.splitwise.oauth.sync_known_people", _noop)
+
+
+@pytest.fixture(autouse=True)
 def _reset_fernet_cache() -> Iterator[None]:
     """Clear the cached Fernet so settings overrides take effect each test."""
     from app.splitwise.tokens import _fernet

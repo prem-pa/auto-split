@@ -16,14 +16,30 @@ import logging
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
+import requests
 from splitwise import Splitwise
 from splitwise.expense import Expense
 from splitwise.user import ExpenseUser
 
 from app.config import settings
+from app.retry import retry_async
 from app.splitwise.models import Split, SplitwiseGroup, SplitwiseUser
 
 log = logging.getLogger(__name__)
+
+# Read-only calls are idempotent — safe to retry on any transient network
+# failure, including ambiguous read-timeouts.
+_SW_READ_RETRY = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+# Writes (create_expense) are NOT idempotent: a retry after the request may
+# have reached Splitwise would create a duplicate expense. So we retry ONLY
+# connection errors — failures that happen before the request is sent (DNS,
+# refused connect), where we know Splitwise never saw it. A read-timeout is
+# deliberately NOT retried here.
+_SW_WRITE_RETRY = (requests.exceptions.ConnectionError,)
 
 
 class SplitwiseAPIError(Exception):
@@ -57,7 +73,11 @@ class SplitwiseClient:
 
     async def get_current_user(self) -> SplitwiseUser:
         """Return the Splitwise profile of the user this client is authed as."""
-        user = await asyncio.to_thread(self._sdk.getCurrentUser)
+        user = await retry_async(
+            lambda: asyncio.to_thread(self._sdk.getCurrentUser),
+            retry_on=_SW_READ_RETRY,
+            name="splitwise getCurrentUser",
+        )
         if user is None:
             raise SplitwiseAPIError("getCurrentUser returned None")
         return SplitwiseUser(
@@ -69,7 +89,11 @@ class SplitwiseClient:
 
     async def get_friends(self) -> list[SplitwiseUser]:
         """Return the user's Splitwise friend list as flat SplitwiseUser models."""
-        friends = await asyncio.to_thread(self._sdk.getFriends)
+        friends = await retry_async(
+            lambda: asyncio.to_thread(self._sdk.getFriends),
+            retry_on=_SW_READ_RETRY,
+            name="splitwise getFriends",
+        )
         if friends is None:
             return []
         return [
@@ -84,7 +108,11 @@ class SplitwiseClient:
 
     async def get_groups(self) -> list[SplitwiseGroup]:
         """Return the user's Splitwise groups (id, name, member ids)."""
-        groups = await asyncio.to_thread(self._sdk.getGroups)
+        groups = await retry_async(
+            lambda: asyncio.to_thread(self._sdk.getGroups),
+            retry_on=_SW_READ_RETRY,
+            name="splitwise getGroups",
+        )
         if groups is None:
             return []
         out: list[SplitwiseGroup] = []
@@ -152,7 +180,13 @@ class SplitwiseClient:
             expense.addUser(eu)
 
         # ``createExpense`` returns ``(expense, errors)`` — both may be None.
-        created, errors = await asyncio.to_thread(self._sdk.createExpense, expense)
+        # Retry connection errors only (see _SW_WRITE_RETRY): those happen
+        # before Splitwise sees the request, so a retry can't double-create.
+        created, errors = await retry_async(
+            lambda: asyncio.to_thread(self._sdk.createExpense, expense),
+            retry_on=_SW_WRITE_RETRY,
+            name="splitwise createExpense",
+        )
         if errors is not None:
             # ``errors`` may be a ``SplitwiseError`` with ``getErrors()`` or a
             # bare dict — coerce to something log-safe without leaking the token.
