@@ -157,6 +157,19 @@ def record_error(message: str) -> None:
         log.exception("langfuse record_error failed")
 
 
+def mark_conversation_end(outcome: str) -> None:
+    """Stamp the current trace as the terminal turn of a conversation.
+
+    Sets ``conversation_end=true`` + ``outcome`` on the active span's
+    metadata. Lets you tell, in Langfuse, a completed conversation
+    (``expense_created`` / ``cancelled`` / ``single_turn`` /
+    ``onboarding_link_sent`` / ``abandoned``) from one still in flight (no
+    marker) — abandoned captures never get a confirm/cancel tap, so the TTL
+    sweep stamps those. No-op when Langfuse is disabled.
+    """
+    update_span(metadata={"conversation_end": True, "outcome": outcome})
+
+
 def trace_context(
     *,
     user_id: str | None = None,
@@ -214,6 +227,7 @@ def trace_context(
 
 __all__ = [
     "is_enabled",
+    "mark_conversation_end",
     "observe",
     "record_error",
     "trace_context",

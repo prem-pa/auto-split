@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import logging
 import re
+from contextvars import ContextVar
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from telegram import CallbackQuery, Update
 
@@ -43,7 +44,14 @@ from app.db.expenses import (
 from app.db.groups import record_membership
 from app.db.models import User
 from app.db.users import get_user, upsert_user
-from app.observability import observe, record_error, trace_context, update_span
+from app.observability import (
+    is_enabled,
+    mark_conversation_end,
+    observe,
+    record_error,
+    trace_context,
+    update_span,
+)
 from app.services.group_context import (
     ResolvedSplit,
     UNRESOLVED,
@@ -113,6 +121,23 @@ async def _capture_user_identity(user: Any) -> None:
         log.exception("upsert_user (identity capture) failed user_id=%s", user.id)
 
 
+# Per-request conversation id. Minted at the top of ``handle_incoming_message``
+# and read deep in ``_finalize_capture`` (to make it the pending expense's id)
+# without threading it through every capture function. Set per webhook task, so
+# it's request-isolated. ``None`` outside a request (e.g. the TTL sweep).
+_conversation_id: ContextVar[UUID | None] = ContextVar("conversation_id", default=None)
+
+
+def _conversation_session_id(conversation_id: UUID) -> str:
+    """The Langfuse session key for a conversation — single source of truth.
+
+    A whole add-an-expense journey (message → confirm/cancel tap) shares this
+    key because the tap carries the same id in its ``callback_data``; single-
+    turn conversations (greeting, ``/start``) are their own session.
+    """
+    return f"conv-{conversation_id.hex}"
+
+
 @observe(name="incoming_message", capture_input=False, capture_output=False)
 async def handle_incoming_message(update: Update) -> None:
     """Top-level message router (DMs and groups, not callbacks).
@@ -142,6 +167,12 @@ async def handle_incoming_message(update: Update) -> None:
     telegram_user_id = user.id
     chat_id = chat.id
 
+    # Mint the conversation id up front so it can be the trace's session key
+    # immediately AND become the pending expense's row id later (set via the
+    # context var, read in _finalize_capture). No placeholder, no update.
+    conversation_id = uuid4()
+    _conversation_id.set(conversation_id)
+
     # Build tag list before opening the trace context — we want these
     # attributes to propagate to every child span (parse, transcribe,
     # create_expense). The configured ``settings.environment`` is added
@@ -156,7 +187,7 @@ async def handle_incoming_message(update: Update) -> None:
 
     with trace_context(
         user_id=str(telegram_user_id),
-        session_id=f"chat-{chat_id}",
+        session_id=_conversation_session_id(conversation_id),
         tags=extra_tags,
         metadata={
             "chat_type": chat.type,
@@ -256,14 +287,26 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
     callback_chat = callback_query.message.chat if callback_query.message else None
     callback_chat_id = callback_chat.id if callback_chat is not None else None
 
-    # Tag callback traces by environment + action prefix; session bound
-    # to the chat so the original capture trace and its later
-    # confirm/cancel/edit traces appear in the same session.
-    action_tag = data.split(":", 1)[0] if ":" in data else "unknown"
+    # callback_data shape: "<prefix>:<uuid_hex>". Parse the id up front so the
+    # tap lands in the same Langfuse session as the message that created the
+    # pending expense (the conversation), rather than a fresh per-chat bucket.
+    prefix, _, hex_id = data.partition(":")
+    pending_id: UUID | None = None
+    if hex_id:
+        try:
+            pending_id = UUID(hex=hex_id)
+        except ValueError:
+            pending_id = None
+    session_id = (
+        _conversation_session_id(pending_id)
+        if pending_id is not None
+        else (f"chat-{callback_chat_id}" if callback_chat_id else None)
+    )
+
     with trace_context(
         user_id=str(telegram_user_id),
-        session_id=f"chat-{callback_chat_id}" if callback_chat_id else None,
-        tags=["callback", action_tag],
+        session_id=session_id,
+        tags=["callback", prefix or "unknown"],
     ):
         update_span(
             input={
@@ -282,16 +325,9 @@ async def handle_callback(callback_query: CallbackQuery) -> None:
         except Exception:  # noqa: BLE001
             log.exception("callback_query.answer() failed")
 
-        # callback_data shape: "<prefix>:<uuid_hex>". Anything else is
-        # ignored.
-        if ":" not in data:
+        # Anything without a valid "<prefix>:<uuid_hex>" id is ignored.
+        if pending_id is None:
             log.info("callback ignored: unparseable data=%r", data)
-            return
-        prefix, _, hex_id = data.partition(":")
-        try:
-            pending_id = UUID(hex=hex_id)
-        except ValueError:
-            log.info("callback ignored: bad uuid hex=%r", hex_id)
             return
 
         message = callback_query.message
@@ -386,6 +422,7 @@ async def _handle_greeting(chat_id: int, first_name: str | None) -> None:
         "add it to Splitwise.\n\n"
         'Example: "I paid $24 at Trader Joe\'s, split equally with Shreya"',
     )
+    mark_conversation_end("single_turn")
 
 
 async def _build_oauth_url(telegram_user_id: int, chat_id: int) -> str | None:
@@ -425,6 +462,7 @@ async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
             "Send me a receipt photo, or describe the expense in text "
             '(e.g. "I paid $24 at Trader Joe\'s, split with Shreya").',
         )
+        mark_conversation_end("already_connected")
         return
 
     url = await _build_oauth_url(telegram_user_id, chat_id)
@@ -438,6 +476,7 @@ async def _handle_start_command(telegram_user_id: int, chat_id: int) -> None:
         "and I'll do the rest.\n\n"
         f"Connect Splitwise: {url}",
     )
+    mark_conversation_end("onboarding_link_sent")
 
 
 async def _handle_unconnected_dm(telegram_user_id: int, chat_id: int) -> None:
@@ -635,6 +674,7 @@ async def _process_text_only_capture(
             parsed.confidence,
         )
         await _safe_send(chat_id, _NOT_ENOUGH_INFO_HINT)
+        mark_conversation_end("single_turn")
         return
 
     await _finalize_capture(
@@ -835,6 +875,9 @@ async def _finalize_capture(
 
     try:
         pending = await create_pending(
+            # Adopt the conversation id as the row id so the message trace
+            # and the later confirm/cancel tap share one Langfuse session.
+            id=_conversation_id.get(),
             telegram_message_id=message.message_id,
             telegram_group_id=telegram_group_id,
             payer_telegram_user_id=payer_telegram_user_id,
@@ -1099,6 +1142,7 @@ async def handle_confirm(
         )
 
     await _edit_or_send(chat_id, message_id, "Added to Splitwise ✓")
+    mark_conversation_end("expense_created")
     log.info(
         "confirm.ok pending=%s sw_expense=%s telegram_user_id=%s",
         pending_id,
@@ -1141,7 +1185,34 @@ async def handle_cancel(
         # will eventually clean it up.
 
     await _edit_or_send(chat_id, message_id, "Cancelled.")
+    mark_conversation_end("cancelled")
     log.info("cancel.ok pending=%s telegram_user_id=%s", pending_id, telegram_user_id)
+
+
+@observe(name="expense_abandoned", capture_input=False, capture_output=False)
+async def _emit_abandoned(conversation_id: UUID) -> None:
+    """Emit one terminal 'abandoned' trace into a conversation's session."""
+    with trace_context(
+        session_id=_conversation_session_id(conversation_id),
+        tags=["abandoned"],
+    ):
+        mark_conversation_end("abandoned")
+
+
+async def mark_conversations_abandoned(conversation_ids: list[UUID]) -> None:
+    """Mark expired-without-a-tap conversations as abandoned in Langfuse.
+
+    Called by the TTL sweep with the ids it just deleted. A pending that
+    reaches the sweep was never confirmed or cancelled (those delete it
+    first), so it's genuinely abandoned. No-op when Langfuse is disabled.
+    """
+    if not is_enabled() or not conversation_ids:
+        return
+    for conversation_id in conversation_ids:
+        try:
+            await _emit_abandoned(conversation_id)
+        except Exception:  # noqa: BLE001 — observability must not break the sweep
+            log.exception("failed to mark conversation abandoned id=%s", conversation_id)
 
 
 # ---------------------------------------------------------------------------

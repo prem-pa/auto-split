@@ -284,6 +284,7 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
 
     async def fake_create_pending(
         *,
+        id: UUID | None = None,
         telegram_message_id: int | None,
         telegram_group_id: int | None,
         payer_telegram_user_id: int | None,
@@ -299,7 +300,9 @@ def mocks(monkeypatch: pytest.MonkeyPatch) -> PipelineMocks:
                 parsed_data=parsed_data,
             )
         )
-        pid = uuid4()
+        # Mirror the real create_pending: adopt the caller's id (the
+        # conversation id) when given, else mint one.
+        pid = id or uuid4()
         pending = ExpensePending(
             id=pid,
             telegram_message_id=telegram_message_id,

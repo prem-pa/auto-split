@@ -36,6 +36,7 @@ class PendingNotFoundError(LookupError):
 
 async def create_pending(
     *,
+    id: UUID | None = None,
     telegram_message_id: int | None,
     telegram_group_id: int | None,
     payer_telegram_user_id: int | None,
@@ -44,6 +45,11 @@ async def create_pending(
     expires_at: datetime | None = None,
 ) -> ExpensePending:
     """Insert a pending expense.
+
+    ``id`` lets the caller supply the row's primary key instead of letting
+    the DB mint one — used so the orchestrator can derive a stable
+    conversation/session id *before* the row exists (see Brick F). When
+    ``None``, Postgres generates the id as before.
 
     ``expires_at`` defaults to the DB-side ``NOW() + 10 minutes``.
     Callers may pass an explicit value (e.g. for tests).
@@ -58,6 +64,8 @@ async def create_pending(
             "parsed_data": parsed_data,
             "receipt_image_url": receipt_image_url,
         }
+        if id is not None:
+            payload["id"] = str(id)
         if expires_at is not None:
             payload["expires_at"] = expires_at.isoformat()
         resp = client.table(_PENDING_TABLE).insert(payload).execute()
@@ -164,18 +172,21 @@ async def mark_completed(
     return await asyncio.to_thread(_q)
 
 
-async def sweep_expired_pending() -> int:
+async def sweep_expired_pending() -> list[UUID]:
     """Delete pending expenses whose ``expires_at`` is in the past.
 
-    Returns the number of rows deleted. Brick F schedules this on a
+    Returns the ids of the deleted rows. These are genuinely abandoned
+    expenses — a confirmed or cancelled one is deleted by its callback
+    handler and never reaches the sweep — so Brick F uses the ids to mark
+    those conversations abandoned in Langfuse. Brick F schedules this on a
     timer; this brick just provides the function.
     """
 
-    def _q() -> int:
+    def _q() -> list[UUID]:
         client = get_supabase()
         now_iso = datetime.now(UTC).isoformat()
         resp = client.table(_PENDING_TABLE).delete().lt("expires_at", now_iso).execute()
-        return len(resp.data or [])
+        return [UUID(str(row["id"])) for row in (resp.data or []) if row.get("id")]
 
     return await asyncio.to_thread(_q)
 
