@@ -30,8 +30,12 @@ Rules:
     "confidence" below 0.3 so the orchestrator can ask for clarification.
   - "currency" is the ISO 4217 code (e.g. "USD", "EUR", "INR"). If
     ambiguous, fall back to the default currency provided.
-  - "merchant" is the business name (from the receipt or the user's text),
-    or null if unclear.
+  - "merchant" is a short label for the expense, used as its Splitwise
+    description. Prefer the business name when there is one (from the
+    receipt or the text, e.g. "Trader Joe's"). When there's no business
+    name, use what the expense was for — the item or category the user
+    mentioned ("coffee", "groceries", "dinner", "Uber"). Only use null if
+    you genuinely can't tell what it was for.
   - "receipt_date" is the calendar date of the expense, in ISO format
     ("YYYY-MM-DD"). Prefer the date printed on the receipt. If a date is
     mentioned without a year (e.g. "May 9"), resolve it to the most recent
